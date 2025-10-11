@@ -196,11 +196,15 @@ class ImageFeatureExtractor:
         output_dir = os.path.join(self.image_dir, dataset_type)
         os.makedirs(output_dir, exist_ok=True)
         
+        # Extract image links as a list (utils.py expects a list, not DataFrame)
+        image_links = df['image_link'].tolist()
+        print(f"Found {len(image_links)} image links to download.")
+        print(f"Images will be saved to: {output_dir}")
+        
         # Use the provided download_images function
-        # It expects a dataframe with 'image_link' column
         try:
-            download_images(df, output_dir)
-            print(f"Images downloaded to: {output_dir}")
+            download_images(image_links, output_dir)
+            print(f"✅ Images downloaded to: {output_dir}")
         except Exception as e:
             print(f"Warning: Some images may have failed to download: {e}")
             print("Continuing with available images...")
@@ -214,6 +218,7 @@ class ImageFeatureExtractor:
             else:
                 return None
         except Exception as e:
+            print(f"Warning: Could not load image {image_path}: {e}")
             return None
     
     def extract_features(self, df, dataset_type='train', cache_file=None):
@@ -226,25 +231,54 @@ class ImageFeatureExtractor:
         
         # Download images first using utils.py
         image_dir = os.path.join(self.image_dir, dataset_type)
-        if not os.path.exists(image_dir) or len(os.listdir(image_dir)) == 0:
+        if not os.path.exists(image_dir) or len(os.listdir(image_dir)) < len(df) * 0.9:  # If less than 90% downloaded
             self.download_images_batch(df, dataset_type)
+        else:
+            print(f"Images already exist in {image_dir}, skipping download...")
         
         features_list = []
         failed_count = 0
         
         print(f"\nExtracting features from {len(df)} images...")
-        for idx, row in tqdm(df.iterrows(), total=len(df)):
+        
+        # Get list of all downloaded images to match with sample_ids
+        downloaded_files = set(os.listdir(image_dir)) if os.path.exists(image_dir) else set()
+        
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing images"):
             try:
-                # Construct image filename (utils.py typically saves as sample_id.jpg)
-                sample_id = row['sample_id']
+                # The utils.py typically saves images with index-based names or hashed names
+                # We need to match them based on the order or filename pattern
                 
-                # Try common image extensions
+                # Try multiple naming patterns that utils.py might use
+                sample_id = row['sample_id']
                 img = None
+                
+                # Pattern 1: Direct sample_id with extensions
                 for ext in ['.jpg', '.jpeg', '.png', '.webp']:
-                    image_path = os.path.join(image_dir, f"{sample_id}{ext}")
-                    img = self.load_image_from_disk(image_path)
-                    if img is not None:
-                        break
+                    filename = f"{sample_id}{ext}"
+                    if filename in downloaded_files:
+                        image_path = os.path.join(image_dir, filename)
+                        img = self.load_image_from_disk(image_path)
+                        if img is not None:
+                            break
+                
+                # Pattern 2: Index-based naming (0.jpg, 1.jpg, etc.)
+                if img is None:
+                    for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                        filename = f"{idx}{ext}"
+                        if filename in downloaded_files:
+                            image_path = os.path.join(image_dir, filename)
+                            img = self.load_image_from_disk(image_path)
+                            if img is not None:
+                                break
+                
+                # Pattern 3: Try to find any file that matches
+                if img is None and len(downloaded_files) > 0:
+                    # Get the nth file (assuming sequential download)
+                    sorted_files = sorted([f for f in downloaded_files if not f.startswith('.')])
+                    if idx < len(sorted_files):
+                        image_path = os.path.join(image_dir, sorted_files[idx])
+                        img = self.load_image_from_disk(image_path)
                 
                 if img is None:
                     # Use zero features for missing images
@@ -264,8 +298,12 @@ class ImageFeatureExtractor:
                 # Fallback: zero vector
                 features_list.append(np.zeros(2048))
                 failed_count += 1
+                if failed_count <= 5:  # Only print first 5 errors
+                    print(f"\nError processing image at index {idx}: {e}")
         
-        print(f"Failed to extract features from {failed_count}/{len(df)} images")
+        print(f"\n{'⚠️' if failed_count > 0 else '✅'} Failed to extract features from {failed_count}/{len(df)} images")
+        if failed_count > 0:
+            print(f"Note: {failed_count} images will use zero features (this may reduce accuracy)")
         
         # Convert to DataFrame
         image_df = pd.DataFrame(
@@ -276,6 +314,7 @@ class ImageFeatureExtractor:
         # Cache if requested
         if cache_file:
             print(f"Caching image features to {cache_file}")
+            os.makedirs(os.path.dirname(cache_file) if os.path.dirname(cache_file) else '.', exist_ok=True)
             image_df.to_pickle(cache_file)
         
         return image_df
@@ -284,8 +323,9 @@ class ImageFeatureExtractor:
 class PricePredictionModel:
     """Main model for price prediction"""
     
-    def __init__(self, use_images=True, use_embeddings=True):
+    def __init__(self, use_images=True, use_embeddings=True, fast_mode=False):
         self.use_images = use_images
+        self.fast_mode = fast_mode
         self.text_extractor = TextFeatureExtractor(use_embeddings=use_embeddings)
         
         if use_images:
@@ -294,42 +334,69 @@ class PricePredictionModel:
         self.scaler = RobustScaler()  # Better for outliers
         self.models = None
     
-    def _build_models(self):
+    def _build_models(self, fast_mode=False):
         """Build ensemble of models"""
-        base_models = [
-            ('xgb', XGBRegressor(
-                n_estimators=300,
-                max_depth=7,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.5,
-                reg_lambda=1.0,
-                random_state=42,
-                tree_method='hist',
-                n_jobs=-1
-            )),
-            ('lgb', LGBMRegressor(
-                n_estimators=300,
-                max_depth=7,
-                learning_rate=0.05,
-                num_leaves=40,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.5,
-                reg_lambda=1.0,
-                random_state=42,
-                n_jobs=-1,
-                verbose=-1
-            )),
-            ('cat', CatBoostRegressor(
-                iterations=300,
-                depth=7,
-                learning_rate=0.05,
-                random_seed=42,
-                verbose=False
-            ))
-        ]
+        if fast_mode:
+            # Faster configuration for quick training
+            base_models = [
+                ('xgb', XGBRegressor(
+                    n_estimators=100,
+                    max_depth=6,
+                    learning_rate=0.1,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    tree_method='hist',
+                    n_jobs=-1
+                )),
+                ('lgb', LGBMRegressor(
+                    n_estimators=100,
+                    max_depth=6,
+                    learning_rate=0.1,
+                    num_leaves=31,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    n_jobs=-1,
+                    verbose=-1
+                ))
+            ]
+        else:
+            # Full configuration for best performance
+            base_models = [
+                ('xgb', XGBRegressor(
+                    n_estimators=300,
+                    max_depth=7,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_alpha=0.5,
+                    reg_lambda=1.0,
+                    random_state=42,
+                    tree_method='hist',
+                    n_jobs=-1
+                )),
+                ('lgb', LGBMRegressor(
+                    n_estimators=300,
+                    max_depth=7,
+                    learning_rate=0.05,
+                    num_leaves=40,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_alpha=0.5,
+                    reg_lambda=1.0,
+                    random_state=42,
+                    n_jobs=-1,
+                    verbose=-1
+                )),
+                ('cat', CatBoostRegressor(
+                    iterations=300,
+                    depth=7,
+                    learning_rate=0.05,
+                    random_seed=42,
+                    verbose=False
+                ))
+            ]
         
         # Meta-learner
         meta_model = Ridge(alpha=1.0)
@@ -337,7 +404,7 @@ class PricePredictionModel:
         stacking = StackingRegressor(
             estimators=base_models,
             final_estimator=meta_model,
-            cv=5,
+            cv=3 if fast_mode else 5,  # Fewer folds in fast mode
             n_jobs=-1
         )
         
@@ -384,16 +451,36 @@ class PricePredictionModel:
         # Validate with cross-validation
         if validate:
             print("\n[3.5/4] Running cross-validation...")
-            self.models = self._build_models()
+            print("This may take 10-30 minutes depending on your hardware...")
+            print("Training base models on 3-5 folds...")
+            
+            self.models = self._build_models(fast_mode=self.fast_mode)
+            
+            # Use a subset for faster CV if dataset is large
+            if len(X_scaled) > 50000 and self.fast_mode:
+                print("Using 20% sample for faster cross-validation...")
+                sample_size = int(len(X_scaled) * 0.2)
+                indices = np.random.choice(len(X_scaled), sample_size, replace=False)
+                X_cv = X_scaled[indices]
+                y_cv = y_log[indices]
+            else:
+                X_cv = X_scaled
+                y_cv = y_log
+            
+            print(f"Running CV on {len(X_cv)} samples...")
             cv_scores = cross_val_score(
-                self.models, X_scaled, y_log,
-                cv=5, scoring='neg_mean_absolute_error', n_jobs=-1
+                self.models, X_cv, y_cv,
+                cv=3 if self.fast_mode else 5,
+                scoring='neg_mean_absolute_error',
+                n_jobs=-1,
+                verbose=1  # Show progress
             )
-            print(f"CV MAE (log scale): {-cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+            print(f"\n✅ CV MAE (log scale): {-cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
         
         # Train final model
         print("\n[4/4] Training final model...")
-        self.models = self._build_models()
+        print("This will take 5-15 minutes...")
+        self.models = self._build_models(fast_mode=self.fast_mode)
         self.models.fit(X_scaled, y_log)
         
         # Calculate training SMAPE
@@ -467,8 +554,8 @@ def main():
     VALIDATE = True  # Run cross-validation
     
     # ===== CHANGE THESE PATHS IF YOUR DATA IS ELSEWHERE =====
-    TRAIN_PATH = 'Data/dataset/train.csv'
-    TEST_PATH = 'Data/dataset/test.csv'
+    TRAIN_PATH = 'Data/student_resource/dataset/train.csv'
+    TEST_PATH = 'Data/student_resource/dataset/test.csv'
     OUTPUT_PATH = 'test_out.csv'
     # ========================================================
     
@@ -496,7 +583,8 @@ def main():
     # Initialize model
     model = PricePredictionModel(
         use_images=USE_IMAGES,
-        use_embeddings=USE_EMBEDDINGS
+        use_embeddings=USE_EMBEDDINGS,
+        fast_mode=FAST_MODE
     )
     
     # Train
