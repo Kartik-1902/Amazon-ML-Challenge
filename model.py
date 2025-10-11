@@ -12,8 +12,6 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
-import requests
-from io import BytesIO
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
@@ -24,7 +22,12 @@ import warnings
 import pickle
 import os
 from tqdm import tqdm
-import time
+import sys
+
+# ===== PATH TO UTILS.PY - CHANGE THIS IF YOUR STRUCTURE IS DIFFERENT =====
+sys.path.append('Data/student_resource/src')  # Add the directory containing utils.py to Python path
+from utils import download_images              # Import the download_images function
+# ===========================================================================
 
 warnings.filterwarnings('ignore')
 
@@ -166,12 +169,14 @@ class TextFeatureExtractor:
 class ImageFeatureExtractor:
     """Extract features from product images using ResNet50"""
     
-    def __init__(self):
+    def __init__(self, image_dir='images'):
         print("Loading image model (ResNet50)...")
         self.model = models.resnet50(pretrained=True)
         # Remove final classification layer
         self.model = nn.Sequential(*list(self.model.children())[:-1])
         self.model.eval()
+        
+        self.image_dir = image_dir
         
         # Image preprocessing
         self.transform = transforms.Compose([
@@ -182,21 +187,36 @@ class ImageFeatureExtractor:
                                std=[0.229, 0.224, 0.225])
         ])
     
-    def download_image(self, url, max_retries=3, timeout=10):
-        """Download image from URL with retries"""
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, timeout=timeout)
-                if response.status_code == 200:
-                    img = Image.open(BytesIO(response.content)).convert('RGB')
-                    return img
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    return None
-                time.sleep(1)  # Wait before retry
-        return None
+    def download_images_batch(self, df, dataset_type='train'):
+        """Download images using the provided utils.py function"""
+        print(f"\nDownloading {dataset_type} images using utils.py...")
+        print("Note: This may take time and might need retries due to throttling")
+        
+        # Create output directory for this dataset type
+        output_dir = os.path.join(self.image_dir, dataset_type)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Use the provided download_images function
+        # It expects a dataframe with 'image_link' column
+        try:
+            download_images(df, output_dir)
+            print(f"Images downloaded to: {output_dir}")
+        except Exception as e:
+            print(f"Warning: Some images may have failed to download: {e}")
+            print("Continuing with available images...")
     
-    def extract_features(self, image_links, cache_file=None):
+    def load_image_from_disk(self, image_path):
+        """Load image from disk"""
+        try:
+            if os.path.exists(image_path):
+                img = Image.open(image_path).convert('RGB')
+                return img
+            else:
+                return None
+        except Exception as e:
+            return None
+    
+    def extract_features(self, df, dataset_type='train', cache_file=None):
         """Extract features from images"""
         
         # Check if cached features exist
@@ -204,17 +224,30 @@ class ImageFeatureExtractor:
             print(f"Loading cached image features from {cache_file}")
             return pd.read_pickle(cache_file)
         
+        # Download images first using utils.py
+        image_dir = os.path.join(self.image_dir, dataset_type)
+        if not os.path.exists(image_dir) or len(os.listdir(image_dir)) == 0:
+            self.download_images_batch(df, dataset_type)
+        
         features_list = []
         failed_count = 0
         
-        print(f"Extracting features from {len(image_links)} images...")
-        for idx, url in enumerate(tqdm(image_links)):
+        print(f"\nExtracting features from {len(df)} images...")
+        for idx, row in tqdm(df.iterrows(), total=len(df)):
             try:
-                # Download image
-                img = self.download_image(url)
+                # Construct image filename (utils.py typically saves as sample_id.jpg)
+                sample_id = row['sample_id']
+                
+                # Try common image extensions
+                img = None
+                for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                    image_path = os.path.join(image_dir, f"{sample_id}{ext}")
+                    img = self.load_image_from_disk(image_path)
+                    if img is not None:
+                        break
                 
                 if img is None:
-                    # Use zero features for failed downloads
+                    # Use zero features for missing images
                     features = np.zeros(2048)
                     failed_count += 1
                 else:
@@ -232,7 +265,7 @@ class ImageFeatureExtractor:
                 features_list.append(np.zeros(2048))
                 failed_count += 1
         
-        print(f"Failed to download {failed_count}/{len(image_links)} images")
+        print(f"Failed to extract features from {failed_count}/{len(df)} images")
         
         # Convert to DataFrame
         image_df = pd.DataFrame(
@@ -328,7 +361,8 @@ class PricePredictionModel:
         if self.use_images:
             print("\n[2/4] Extracting image features...")
             image_features = self.image_extractor.extract_features(
-                train_df['image_link'].values,
+                train_df,
+                dataset_type='train',
                 cache_file='train_image_features.pkl'
             )
             X = pd.concat([text_features, image_features], axis=1)
@@ -385,7 +419,8 @@ class PricePredictionModel:
         if self.use_images:
             print("\n[2/3] Extracting image features...")
             image_features = self.image_extractor.extract_features(
-                test_df['image_link'].values,
+                test_df,
+                dataset_type='test',
                 cache_file='test_image_features.pkl'
             )
             X = pd.concat([text_features, image_features], axis=1)
@@ -431,17 +466,27 @@ def main():
     USE_EMBEDDINGS = True  # Set to False if sentence-transformers not available
     VALIDATE = True  # Run cross-validation
     
+    # ===== CHANGE THESE PATHS IF YOUR DATA IS ELSEWHERE =====
+    TRAIN_PATH = 'Data/dataset/train.csv'
+    TEST_PATH = 'Data/dataset/test.csv'
+    OUTPUT_PATH = 'test_out.csv'
+    # ========================================================
+    
     print("\n" + "="*60)
     print("SMART PRODUCT PRICING CHALLENGE - ML PIPELINE")
     print("="*60)
     print(f"Use Images: {USE_IMAGES}")
     print(f"Use Embeddings: {USE_EMBEDDINGS}")
     print(f"Validation: {VALIDATE}")
+    print(f"\nData paths:")
+    print(f"  Train: {TRAIN_PATH}")
+    print(f"  Test: {TEST_PATH}")
+    print(f"  Output: {OUTPUT_PATH}")
     
     # Load data
     print("\nLoading data...")
-    train_df = pd.read_csv('dataset/train.csv')
-    test_df = pd.read_csv('dataset/test.csv')
+    train_df = pd.read_csv(TRAIN_PATH)
+    test_df = pd.read_csv(TEST_PATH)
     
     print(f"Training samples: {len(train_df)}")
     print(f"Test samples: {len(test_df)}")
@@ -479,8 +524,8 @@ def main():
     print(f"Predicted price mean: ${np.mean(predictions):.2f}")
     
     # Save submission
-    submission.to_csv('test_out.csv', index=False)
-    print(f"\nSubmission saved to: test_out.csv")
+    submission.to_csv(OUTPUT_PATH, index=False)
+    print(f"\nSubmission saved to: {OUTPUT_PATH}")
     print("="*60)
 
 
