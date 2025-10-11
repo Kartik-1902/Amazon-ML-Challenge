@@ -1,6 +1,12 @@
 """
-Complete ML Pipeline for Smart Product Pricing Challenge
-Includes: Text processing, Image processing, Model training, and Prediction
+Complete ML Pipeline for Smart Product Pricing Challenge - BEST PRACTICE VERSION
+Includes: Text processing, Image processing with checkpoints, Model training, and Prediction
+Key improvements:
+- Uses official utils.py for image downloading
+- Checkpointing for robust feature extraction
+- Better caching strategy
+- Progress tracking and recovery
+- Organized file structure
 """
 
 import pandas as pd
@@ -23,15 +29,15 @@ import pickle
 import os
 from tqdm import tqdm
 import sys
-import requests
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-# No longer need to modify sys.path for utils.py
+# Import the official download utility
+sys.path.append('Data/student_resource')
+from src.utils import download_images
 
 warnings.filterwarnings('ignore')
 
-# If sentence-transformers not available, install: pip install sentence-transformers
+# Try to import sentence-transformers
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
@@ -49,7 +55,7 @@ class TextFeatureExtractor:
 
         if self.use_embeddings:
             print("Loading text embedding model...")
-            self.text_model = SentenceTransformer('all-MiniLM-L6-v2') # Smaller, faster
+            self.text_model = SentenceTransformer('all-MiniLM-L6-v2')
         else:
             self.tfidf = TfidfVectorizer(
                 max_features=1000,
@@ -77,7 +83,6 @@ class TextFeatureExtractor:
             if ipq_match:
                 ipq_values.append(int(ipq_match.group(1)))
             else:
-                # Try to find "pack of X" or "X pack"
                 pack_match = re.search(r'(\d+)\s*pack|pack\s*of\s*(\d+)', text_str, re.IGNORECASE)
                 if pack_match:
                     ipq_values.append(int(pack_match.group(1) or pack_match.group(2)))
@@ -99,13 +104,11 @@ class TextFeatureExtractor:
             for text in texts
         ]
 
-        # Check for brand indicators (capitalized words)
         features['capital_word_count'] = [
             len([w for w in str(text).split() if w and w[0].isupper()])
             for text in texts
         ]
 
-        # Number presence (specs often indicate quality)
         features['number_count'] = [
             len(re.findall(r'\d+', str(text)))
             for text in texts
@@ -164,17 +167,16 @@ class TextFeatureExtractor:
 
 
 class ImageFeatureExtractor:
-    """Extract features from product images using ResNet50"""
+    """Extract features from product images using ResNet50 with checkpointing"""
 
     def __init__(self, image_dir='images'):
         print("Loading image model (ResNet50)...")
         self.model = models.resnet50(pretrained=True)
-        self.model = nn.Sequential(*list(self.model.children())[:-1]) # Remove final classification layer
+        self.model = nn.Sequential(*list(self.model.children())[:-1])
         self.model.eval()
 
         self.image_dir = image_dir
 
-        # Image preprocessing
         self.transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
@@ -183,57 +185,44 @@ class ImageFeatureExtractor:
                                  std=[0.229, 0.224, 0.225])
         ])
 
-    def _download_single_image(self, args):
-        """Helper function to download one image with retries."""
-        url, filepath = args
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        retries = 3
-        for attempt in range(retries):
-            try:
-                response = requests.get(url, headers=headers, stream=True, timeout=15)
-                if response.status_code == 200:
-                    with open(filepath, 'wb') as f:
-                        for chunk in response.iter_content(1024):
-                            f.write(chunk)
-                    return True # Success
-                # Don't retry on client errors like 404 Not Found
-                elif 400 <= response.status_code < 500:
-                    break
-            except requests.exceptions.RequestException:
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt) # Exponential backoff
-        return False # Failure
-
     def download_images_batch(self, df, dataset_type='train'):
-        """Download images in parallel using a predictable naming scheme."""
-        print(f"\nDownloading {dataset_type} images...")
+        """
+        Download images using official utils.py download_images function.
+        Only downloads missing images.
+        """
+        print(f"\n📥 Checking {dataset_type} images...")
         output_dir = os.path.join(self.image_dir, dataset_type)
         os.makedirs(output_dir, exist_ok=True)
 
-        tasks = []
-        for _, row in df.iterrows():
-            url = row['image_link']
-            sample_id = row['sample_id']
-            # Save all images as .jpg for consistency. PIL can handle format differences.
-            filepath = os.path.join(output_dir, f"{sample_id}.jpg")
-            if not os.path.exists(filepath):
-                 tasks.append((url, filepath))
-
-        if not tasks:
-            print("✅ All required images are already downloaded.")
+        # Get list of image links
+        image_links = df['image_link'].tolist()
+        
+        # Check which images already exist
+        existing_images = set()
+        if os.path.exists(output_dir):
+            existing_images = {f for f in os.listdir(output_dir) if f.endswith('.jpg')}
+        
+        # Filter out images that already exist
+        # Note: utils.py downloads with numbered names (0.jpg, 1.jpg, etc.)
+        # We need to check if we have the right number of images
+        existing_count = len(existing_images)
+        required_count = len(image_links)
+        
+        if existing_count >= required_count:
+            print(f"✅ All {required_count} images already downloaded.")
             return
-
-        print(f"Found {len(tasks)} new images to download to: {output_dir}")
-        successful_downloads = 0
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            futures = [executor.submit(self._download_single_image, task) for task in tasks]
-            for future in tqdm(as_completed(futures), total=len(tasks), desc="Downloading images"):
-                if future.result():
-                    successful_downloads += 1
-
-        print(f"✅ Downloaded {successful_downloads}/{len(tasks)} new images.")
-        if successful_downloads < len(tasks):
-            print(f"⚠️ Failed to download {len(tasks) - successful_downloads} images due to errors.")
+        
+        print(f"🔄 Downloading {required_count - existing_count} new images...")
+        print(f"   Destination: {output_dir}")
+        
+        # Use official download_images from utils.py
+        # This function handles parallel downloading efficiently
+        try:
+            download_images(image_links, output_dir)
+            print(f"✅ Download complete!")
+        except Exception as e:
+            print(f"⚠️ Error during download: {e}")
+            print("   Continuing with available images...")
 
     def load_image_from_disk(self, image_path):
         """Load image from disk"""
@@ -243,32 +232,90 @@ class ImageFeatureExtractor:
                 return img
             else:
                 return None
-        except Exception as e:
-            # This can happen for corrupted files
-            # print(f"Warning: Could not load image {image_path}: {e}")
+        except Exception:
             return None
 
-    def extract_features(self, df, dataset_type='train', cache_file=None):
-        """Extract features from images"""
+    def get_image_path(self, dataset_type, row_index):
+        """
+        Get image path. utils.py saves images as 0.jpg, 1.jpg, 2.jpg, etc.
+        based on the order in the DataFrame.
+        """
+        image_dir = os.path.join(self.image_dir, dataset_type)
+        image_path = os.path.join(image_dir, f"{row_index}.jpg")
+        return image_path
 
-        if cache_file and os.path.exists(cache_file):
-            print(f"Loading cached image features from {cache_file}")
-            return pd.read_pickle(cache_file)
+    def extract_features(self, df, dataset_type='train', cache_file=None, 
+                        force_recompute=False, checkpoint_every=500):
+        """
+        Extract features from images with checkpointing support
+        
+        Args:
+            df: DataFrame with image_link and sample_id columns
+            dataset_type: 'train' or 'test'
+            cache_file: Path to cache file
+            force_recompute: If True, ignore cache and recompute
+            checkpoint_every: Save checkpoint every N images
+        """
+        
+        # Check if final cache exists
+        if cache_file and os.path.exists(cache_file) and not force_recompute:
+            print(f"✅ Loading cached image features from {cache_file}")
+            cached_features = pd.read_pickle(cache_file)
+            
+            if len(cached_features) == len(df):
+                print(f"   Cache is valid ({len(cached_features)} samples)")
+                return cached_features
+            else:
+                print(f"⚠️  Cache size mismatch. Recomputing...")
 
-        # Download images first
+        # Setup checkpoint file
+        checkpoint_file = None
+        if cache_file:
+            checkpoint_file = cache_file.replace('.pkl', '_checkpoint.pkl')
+        
+        # Try to load checkpoint
+        processed_indices = set()
+        checkpoint_features = {}
+        start_idx = 0
+        
+        if checkpoint_file and os.path.exists(checkpoint_file) and not force_recompute:
+            print(f"📂 Found checkpoint: {checkpoint_file}")
+            try:
+                checkpoint_df = pd.read_pickle(checkpoint_file)
+                checkpoint_features = {idx: row.values for idx, row in checkpoint_df.iterrows()}
+                processed_indices = set(checkpoint_features.keys())
+                start_idx = len(processed_indices)
+                print(f"   ✅ Resuming from {start_idx}/{len(df)} images")
+            except Exception as e:
+                print(f"⚠️  Could not load checkpoint: {e}. Starting fresh...")
+
+        # Download images first using official utils
         self.download_images_batch(df, dataset_type)
 
-        features_list = []
+        features_list = [None] * len(df)  # Pre-allocate
         failed_count = 0
-        image_dir = os.path.join(self.image_dir, dataset_type)
-        print(f"\nExtracting features from {len(df)} images...")
+        
+        if start_idx == 0:
+            print(f"\n🔄 Extracting features from {len(df)} images...")
+        else:
+            print(f"\n🔄 Extracting remaining {len(df) - start_idx} images...")
 
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing images"):
-            img = None
+        processed_count = start_idx
+        
+        # Reset df index to ensure we can use positional indexing
+        df_reset = df.reset_index(drop=True)
+        
+        for idx in tqdm(range(len(df_reset)), total=len(df_reset), 
+                       desc="Processing images", initial=start_idx):
+            
+            # Use checkpoint if available
+            if idx in processed_indices:
+                features_list[idx] = checkpoint_features[idx]
+                continue
+            
             try:
-                # Use the new predictable naming scheme
-                sample_id = row['sample_id']
-                image_path = os.path.join(image_dir, f"{sample_id}.jpg")
+                # utils.py saves images as 0.jpg, 1.jpg, 2.jpg based on row position
+                image_path = self.get_image_path(dataset_type, idx)
                 img = self.load_image_from_disk(image_path)
 
                 if img is None:
@@ -279,17 +326,27 @@ class ImageFeatureExtractor:
                     with torch.no_grad():
                         features = self.model(img_tensor).squeeze().numpy()
 
-                features_list.append(features)
+                features_list[idx] = features
+                processed_count += 1
+                
+                # Save checkpoint periodically
+                if checkpoint_file and processed_count % checkpoint_every == 0:
+                    temp_df = pd.DataFrame(
+                        [f for f in features_list if f is not None],
+                        columns=[f'img_feat_{i}' for i in range(2048)]
+                    )
+                    temp_df.to_pickle(checkpoint_file)
+                    print(f"\n💾 Checkpoint: {processed_count}/{len(df)} processed")
 
             except Exception as e:
-                features_list.append(np.zeros(2048)) # Fallback to zero vector on error
+                features_list[idx] = np.zeros(2048)
                 failed_count += 1
-                if failed_count <= 5:
-                    print(f"\nError processing image for sample {row.get('sample_id', 'N/A')}: {e}")
+                if failed_count <= 3:
+                    print(f"\n⚠️  Error for index {idx}: {str(e)[:50]}")
 
-        print(f"\n{'⚠️' if failed_count > 0 else '✅'} Failed to extract features from {failed_count}/{len(df)} images")
+        print(f"\n{'⚠️' if failed_count > 0 else '✅'} Complete. Failed: {failed_count}/{len(df)}")
         if failed_count > 0:
-            print(f"Note: {failed_count} images will use zero features (this may reduce accuracy)")
+            print(f"   Note: {failed_count} images will use zero features (may reduce accuracy)")
 
         # Convert to DataFrame
         image_df = pd.DataFrame(
@@ -297,10 +354,18 @@ class ImageFeatureExtractor:
             columns=[f'img_feat_{i}' for i in range(2048)]
         )
 
+        # Save final cache
         if cache_file:
-            print(f"Caching image features to {cache_file}")
-            os.makedirs(os.path.dirname(cache_file) if os.path.dirname(cache_file) else '.', exist_ok=True)
+            cache_dir = os.path.dirname(cache_file)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            print(f"💾 Saving final cache to {cache_file}")
             image_df.to_pickle(cache_file)
+            
+            # Remove checkpoint after successful completion
+            if checkpoint_file and os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                print(f"🗑️  Checkpoint removed (processing complete)")
 
         return image_df
 
@@ -316,14 +381,13 @@ class PricePredictionModel:
         if use_images:
             self.image_extractor = ImageFeatureExtractor()
 
-        self.scaler = RobustScaler() # Better for outliers
+        self.scaler = RobustScaler()
         self.models = None
 
     def _build_models(self, fast_mode=False):
         """Build ensemble of models"""
         if fast_mode:
-            # Faster configuration for quick training
-            print("Using FAST MODE model configuration...")
+            print("Using FAST MODE configuration...")
             base_models = [
                 ('lgb', LGBMRegressor(
                     n_estimators=150,
@@ -338,8 +402,7 @@ class PricePredictionModel:
             meta_model = Ridge(alpha=1.0)
             stacking_cv = 2
         else:
-            # Full configuration for best performance
-            print("Using FULL PERFORMANCE model configuration...")
+            print("Using FULL PERFORMANCE configuration...")
             base_models = [
                 ('xgb', XGBRegressor(
                     n_estimators=300, max_depth=7, learning_rate=0.05, subsample=0.8,
@@ -388,7 +451,8 @@ class PricePredictionModel:
             image_features = self.image_extractor.extract_features(
                 train_df,
                 dataset_type='train',
-                cache_file='train_image_features.pkl'
+                cache_file='cache/train_image_features.pkl',
+                checkpoint_every=500
             )
             X = pd.concat([text_features, image_features.set_index(text_features.index)], axis=1)
         else:
@@ -397,17 +461,15 @@ class PricePredictionModel:
         print(f"\nTotal features: {X.shape[1]}")
 
         y = train_df['price'].values
-        y_log = np.log1p(y) # Log transform target to handle skewness
+        y_log = np.log1p(y)
 
         print("\n[3/4] Scaling features...")
         X_scaled = self.scaler.fit_transform(X)
 
         if validate:
             print("\n[3.5/4] Running cross-validation...")
-            # CV is intensive, so we build a temporary model for it
-            cv_model = self._build_models(fast_mode=True) # Always use fast mode for CV to save time
+            cv_model = self._build_models(fast_mode=True)
             
-            print(f"Running CV on {len(X_scaled)} samples...")
             cv_scores = cross_val_score(
                 cv_model, X_scaled, y_log,
                 cv=3,
@@ -415,14 +477,12 @@ class PricePredictionModel:
                 n_jobs=-1,
                 verbose=1
             )
-            print(f"\n✅ CV MAE (log scale): {-cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+            print(f"\n✅ CV MAE (log): {-cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
 
         print("\n[4/4] Training final model...")
-        print("This may take some time...")
         self.models = self._build_models(fast_mode=self.fast_mode)
         self.models.fit(X_scaled, y_log)
 
-        # Calculate training SMAPE
         train_pred = np.expm1(self.models.predict(X_scaled))
         train_smape = self.calculate_smape(y, train_pred)
         print(f"\nTraining SMAPE: {train_smape:.2f}%")
@@ -437,28 +497,26 @@ class PricePredictionModel:
         print("🚀 STARTING PREDICTION PIPELINE")
         print("="*60)
 
-        # Extract text features
         print("\n[1/3] Extracting text features...")
         text_features = self.text_extractor.transform(test_df['catalog_content'].values)
 
-        # Extract image features
         if self.use_images:
             print("\n[2/3] Extracting image features...")
             image_features = self.image_extractor.extract_features(
                 test_df,
                 dataset_type='test',
-                cache_file='test_image_features.pkl'
+                cache_file='cache/test_image_features.pkl',
+                checkpoint_every=500
             )
             X = pd.concat([text_features, image_features.set_index(text_features.index)], axis=1)
         else:
             X = text_features
 
-        print("\n[3/3] Scaling features and making predictions...")
+        print("\n[3/3] Making predictions...")
         X_scaled = self.scaler.transform(X)
 
-        # Predict and inverse log transform
         predictions = np.expm1(self.models.predict(X_scaled))
-        predictions = np.maximum(predictions, 0.01) # Ensure positive prices
+        predictions = np.maximum(predictions, 0.01)
 
         print("\n" + "="*60)
         print("✅ PREDICTION COMPLETE!")
@@ -466,18 +524,19 @@ class PricePredictionModel:
 
         return predictions
 
-    def save(self, filepath='model.pkl'):
+    def save(self, filepath='models/model.pkl'):
         """Save model to disk"""
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, 'wb') as f:
             pickle.dump(self, f)
-        print(f"Model saved to {filepath}")
+        print(f"💾 Model saved to {filepath}")
 
     @staticmethod
-    def load(filepath='model.pkl'):
+    def load(filepath='models/model.pkl'):
         """Load model from disk"""
         with open(filepath, 'rb') as f:
             model = pickle.load(f)
-        print(f"Model loaded from {filepath}")
+        print(f"📂 Model loaded from {filepath}")
         return model
 
 
@@ -485,35 +544,48 @@ def main():
     """Main execution function"""
 
     # ===== CONFIGURATION =====
-    USE_IMAGES = True       # Set to False for faster training without images
-    USE_EMBEDDINGS = True   # Set to False if sentence-transformers is not available
-    VALIDATE = True         # Run cross-validation before final training
-    FAST_MODE = False       # Use smaller models for quick testing. Set to False for best performance.
+    USE_IMAGES = True
+    USE_EMBEDDINGS = True
+    VALIDATE = True
+    FAST_MODE = False
     
     # ===== PATHS =====
     TRAIN_PATH = 'Data/student_resource/dataset/train.csv'
     TEST_PATH = 'Data/student_resource/dataset/test.csv'
-    OUTPUT_PATH = 'test_out.csv'
+    OUTPUT_PATH = 'submissions/test_out.csv'
+    MODEL_PATH = 'models/price_prediction_model.pkl'
     # =========================
 
+    # Create directories
+    os.makedirs('cache', exist_ok=True)
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('submissions', exist_ok=True)
+
     print("\n" + "="*60)
-    print("SMART PRODUCT PRICING CHALLENGE - ML PIPELINE")
+    print("SMART PRODUCT PRICING - ML PIPELINE (BEST PRACTICE)")
     print("="*60)
-    print(f"Settings: Use Images={USE_IMAGES}, Use Embeddings={USE_EMBEDDINGS}, Validate={VALIDATE}, Fast Mode={FAST_MODE}")
+    print(f"Configuration:")
+    print(f"  - Use Images: {USE_IMAGES}")
+    print(f"  - Use Embeddings: {USE_EMBEDDINGS}")
+    print(f"  - Validate: {VALIDATE}")
+    print(f"  - Fast Mode: {FAST_MODE}")
+    print(f"  - Using official utils.py for downloads")
+    print(f"  - Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Load data
-    print("\nLoading data...")
+    print("\n📂 Loading data...")
     try:
         train_df = pd.read_csv(TRAIN_PATH)
         test_df = pd.read_csv(TEST_PATH)
     except FileNotFoundError as e:
-        print(f"Error: Data file not found. Make sure your paths are correct.")
-        print(f"Missing file: {e.filename}")
-        print("Expected structure: \n- your_script.py\n- dataset/\n  - train.csv\n  - test.csv")
+        print(f"❌ Error: Data file not found: {e.filename}")
+        print("Expected structure:")
+        print("  - Data/student_resource/dataset/train.csv")
+        print("  - Data/student_resource/dataset/test.csv")
         return
 
-    print(f"Training samples: {len(train_df)}")
-    print(f"Test samples: {len(test_df)}")
+    print(f"  Training samples: {len(train_df)}")
+    print(f"  Test samples: {len(test_df)}")
     
     # Initialize and train model
     model = PricePredictionModel(
@@ -522,24 +594,24 @@ def main():
         fast_mode=FAST_MODE
     )
     model.fit(train_df, validate=VALIDATE)
-    model.save('price_prediction_model.pkl')
+    model.save(MODEL_PATH)
 
     # Predict
     predictions = model.predict(test_df)
 
-    # Create submission file
+    # Create submission
     submission = pd.DataFrame({
         'sample_id': test_df['sample_id'],
         'price': predictions
     })
 
     print("\n" + "="*60)
-    print("SUBMISSION STATISTICS")
+    print("📊 SUBMISSION STATISTICS")
     print("="*60)
     print(submission['price'].describe())
 
     submission.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n✅ Submission file saved to: {OUTPUT_PATH}")
+    print(f"\n✅ Submission saved to: {OUTPUT_PATH}")
     print("="*60)
 
 
