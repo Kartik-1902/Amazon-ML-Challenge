@@ -1,18 +1,13 @@
 """
-OPTIMIZED ML Pipeline for Smart Product Pricing Challenge
-Key improvements:
-- Optimized feature engineering with domain knowledge
-- Better ensemble configuration
-- Improved model architecture for better predictions
-- Enhanced progress feedback everywhere
-- Target: Reduce SMAPE from 49.96% to <30%
+FIXED ML Pipeline with Proper Progress Tracking
+Key fix: Manual K-Fold with real-time fold progress (no more waiting blind!)
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_error
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -20,7 +15,7 @@ from PIL import Image
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
-from sklearn.ensemble import StackingRegressor, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import StackingRegressor, GradientBoostingRegressor
 from sklearn.linear_model import Ridge, ElasticNet
 import re
 import warnings
@@ -31,24 +26,21 @@ import sys
 from datetime import datetime
 import time
 
-# Import the official download utility
 sys.path.append('Data/student_resource')
 from src.utils import download_images
 
 warnings.filterwarnings('ignore')
 
-# Try to import sentence-transformers
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-    print("Warning: sentence-transformers not installed. Using simpler text features.")
     from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 class TextFeatureExtractor:
-    """OPTIMIZED: Extract advanced features from catalog content"""
+    """Extract features from catalog content"""
 
     def __init__(self, use_embeddings=True):
         self.use_embeddings = use_embeddings and SENTENCE_TRANSFORMERS_AVAILABLE
@@ -58,38 +50,30 @@ class TextFeatureExtractor:
             self.text_model = SentenceTransformer('all-MiniLM-L6-v2')
             print("   ✅ Model loaded")
         else:
-            print("📝 Initializing TF-IDF vectorizer...")
             self.tfidf = TfidfVectorizer(
-                max_features=1500,  # Increased from 1000
+                max_features=1500,
                 ngram_range=(1, 3),
                 stop_words='english',
                 min_df=2
             )
 
     def extract_handcrafted_features(self, texts):
-        """ENHANCED: Extract more sophisticated text features"""
-        print("   🔧 Extracting advanced text features...")
+        """Extract text features"""
         features = {}
 
-        # Basic text statistics
         features['text_length'] = [len(str(text)) for text in texts]
         features['word_count'] = [len(str(text).split()) for text in texts]
         features['avg_word_length'] = [
             np.mean([len(word) for word in str(text).split()]) if len(str(text).split()) > 0 else 0
             for text in texts
         ]
-        
-        # NEW: Character diversity
         features['unique_chars'] = [len(set(str(text))) for text in texts]
-        
-        # NEW: Sentence count
         features['sentence_count'] = [len(str(text).split('.')) for text in texts]
 
-        # IMPROVED: Extract IPQ with better patterns
+        # Extract IPQ
         ipq_values = []
         for text in texts:
             text_str = str(text).lower()
-            # Try multiple patterns
             ipq_match = re.search(r'ipq[:\s]*(\d+)', text_str)
             if ipq_match:
                 ipq_values.append(int(ipq_match.group(1)))
@@ -101,139 +85,74 @@ class TextFeatureExtractor:
                 else:
                     ipq_values.append(1)
         features['ipq'] = ipq_values
-        features['ipq_log'] = np.log1p(ipq_values)  # Log transform for better distribution
+        features['ipq_log'] = np.log1p(ipq_values)
 
-        # ENHANCED: Price indicator keywords with more categories
-        premium_keywords = ['premium', 'luxury', 'deluxe', 'professional', 'pro', 'elite', 'supreme', 'ultra']
-        budget_keywords = ['budget', 'value', 'basic', 'economy', 'affordable', 'cheap', 'discount']
-        quality_keywords = ['organic', 'natural', 'fresh', 'pure', 'authentic', 'original']
+        # Keywords
+        premium_keywords = ['premium', 'luxury', 'deluxe', 'professional', 'elite', 'supreme', 'ultra']
+        budget_keywords = ['budget', 'value', 'basic', 'economy', 'affordable', 'discount']
+        quality_keywords = ['organic', 'natural', 'fresh', 'pure', 'authentic']
         
-        features['has_premium_words'] = [
-            sum(1 for kw in premium_keywords if kw in str(text).lower())
-            for text in texts
-        ]
-        features['has_budget_words'] = [
-            sum(1 for kw in budget_keywords if kw in str(text).lower())
-            for text in texts
-        ]
-        features['has_quality_words'] = [
-            sum(1 for kw in quality_keywords if kw in str(text).lower())
-            for text in texts
-        ]
+        features['has_premium_words'] = [sum(1 for kw in premium_keywords if kw in str(text).lower()) for text in texts]
+        features['has_budget_words'] = [sum(1 for kw in budget_keywords if kw in str(text).lower()) for text in texts]
+        features['has_quality_words'] = [sum(1 for kw in quality_keywords if kw in str(text).lower()) for text in texts]
 
-        # Brand indicators (capitalized words)
-        features['capital_word_count'] = [
-            len([w for w in str(text).split() if w and w[0].isupper()])
-            for text in texts
-        ]
-
-        # Number presence and density
-        features['number_count'] = [
-            len(re.findall(r'\d+', str(text)))
-            for text in texts
-        ]
-        features['number_density'] = [
-            len(re.findall(r'\d+', str(text))) / max(len(str(text).split()), 1)
-            for text in texts
-        ]
+        features['capital_word_count'] = [len([w for w in str(text).split() if w and w[0].isupper()]) for text in texts]
+        features['number_count'] = [len(re.findall(r'\d+', str(text))) for text in texts]
+        features['number_density'] = [len(re.findall(r'\d+', str(text))) / max(len(str(text).split()), 1) for text in texts]
         
-        # NEW: Extract specific measurements (oz, lb, kg, ml, etc.)
-        features['has_weight'] = [
-            1 if re.search(r'\d+\s*(oz|lb|kg|g|gram)', str(text).lower()) else 0
-            for text in texts
-        ]
-        features['has_volume'] = [
-            1 if re.search(r'\d+\s*(ml|l|liter|fl oz|gallon)', str(text).lower()) else 0
-            for text in texts
-        ]
-        
-        # NEW: Special characters
-        features['special_char_count'] = [
-            len(re.findall(r'[^a-zA-Z0-9\s]', str(text)))
-            for text in texts
-        ]
+        features['has_weight'] = [1 if re.search(r'\d+\s*(oz|lb|kg|g|gram)', str(text).lower()) else 0 for text in texts]
+        features['has_volume'] = [1 if re.search(r'\d+\s*(ml|l|liter|fl oz|gallon)', str(text).lower()) else 0 for text in texts]
+        features['special_char_count'] = [len(re.findall(r'[^a-zA-Z0-9\s]', str(text))) for text in texts]
 
-        print(f"   ✅ Extracted {len(features)} handcrafted features")
         return pd.DataFrame(features)
 
     def fit_transform(self, texts):
-        """Fit and transform texts to features"""
         handcrafted = self.extract_handcrafted_features(texts)
 
         if self.use_embeddings:
-            print("   🔄 Generating text embeddings...")
-            embeddings = self.text_model.encode(
-                [str(text) for text in texts],
-                show_progress_bar=True,
-                batch_size=64  # Increased batch size for speed
-            )
-            embeddings_df = pd.DataFrame(
-                embeddings,
-                columns=[f'text_emb_{i}' for i in range(embeddings.shape[1])]
-            )
-            print(f"   ✅ Generated {embeddings.shape[1]} embedding features")
+            embeddings = self.text_model.encode([str(text) for text in texts], show_progress_bar=True, batch_size=64)
+            embeddings_df = pd.DataFrame(embeddings, columns=[f'text_emb_{i}' for i in range(embeddings.shape[1])])
             return pd.concat([handcrafted, embeddings_df], axis=1)
         else:
-            print("   🔄 Generating TF-IDF features...")
             tfidf_features = self.tfidf.fit_transform([str(text) for text in texts])
-            tfidf_df = pd.DataFrame(
-                tfidf_features.toarray(),
-                columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])]
-            )
-            print(f"   ✅ Generated {tfidf_features.shape[1]} TF-IDF features")
+            tfidf_df = pd.DataFrame(tfidf_features.toarray(), columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])])
             return pd.concat([handcrafted, tfidf_df], axis=1)
 
     def transform(self, texts):
-        """Transform texts to features"""
         handcrafted = self.extract_handcrafted_features(texts)
 
         if self.use_embeddings:
-            print("   🔄 Generating text embeddings...")
-            embeddings = self.text_model.encode(
-                [str(text) for text in texts],
-                show_progress_bar=True,
-                batch_size=64
-            )
-            embeddings_df = pd.DataFrame(
-                embeddings,
-                columns=[f'text_emb_{i}' for i in range(embeddings.shape[1])]
-            )
+            embeddings = self.text_model.encode([str(text) for text in texts], show_progress_bar=True, batch_size=64)
+            embeddings_df = pd.DataFrame(embeddings, columns=[f'text_emb_{i}' for i in range(embeddings.shape[1])])
             return pd.concat([handcrafted, embeddings_df], axis=1)
         else:
             tfidf_features = self.tfidf.transform([str(text) for text in texts])
-            tfidf_df = pd.DataFrame(
-                tfidf_features.toarray(),
-                columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])]
-            )
+            tfidf_df = pd.DataFrame(tfidf_features.toarray(), columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])])
             return pd.concat([handcrafted, tfidf_df], axis=1)
 
 
 class ImageFeatureExtractor:
-    """OPTIMIZED: Extract features from product images with better caching"""
+    """Extract image features"""
 
     def __init__(self, image_dir='images'):
-        print("🖼️  Loading image model (ResNet50)...")
+        print("🖼️  Loading ResNet50...")
         self.model = models.resnet50(pretrained=True)
         self.model = nn.Sequential(*list(self.model.children())[:-1])
         self.model.eval()
         
-        # OPTIMIZATION: Move model to GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = self.model.to(self.device)
-        print(f"   ✅ Model loaded on {self.device}")
+        print(f"   ✅ Model on {self.device}")
 
         self.image_dir = image_dir
-
         self.transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def download_images_batch(self, df, dataset_type='train'):
-        """Download images using official utils.py"""
         print(f"\n📥 Checking {dataset_type} images...")
         output_dir = os.path.join(self.image_dir, dataset_type)
         os.makedirs(output_dir, exist_ok=True)
@@ -243,25 +162,18 @@ class ImageFeatureExtractor:
         if os.path.exists(output_dir):
             existing_images = {f for f in os.listdir(output_dir) if f.endswith('.jpg')}
         
-        existing_count = len(existing_images)
-        required_count = len(image_links)
-        
-        if existing_count >= required_count:
-            print(f"   ✅ All {required_count} images already downloaded.")
+        if len(existing_images) >= len(image_links):
+            print(f"   ✅ All images present")
             return
         
-        missing_count = required_count - existing_count
-        print(f"   🔄 Downloading {missing_count} new images...")
-        print(f"   📂 Destination: {output_dir}")
-        
+        print(f"   🔄 Downloading {len(image_links) - len(existing_images)} images...")
         try:
             download_images(image_links, output_dir)
-            print(f"   ✅ Download complete!")
+            print(f"   ✅ Download complete")
         except Exception as e:
-            print(f"   ⚠️  Error during download: {e}")
+            print(f"   ⚠️  Download error: {e}")
 
     def load_image_from_disk(self, image_path):
-        """Load image from disk"""
         try:
             if os.path.exists(image_path):
                 return Image.open(image_path).convert('RGB')
@@ -270,54 +182,33 @@ class ImageFeatureExtractor:
             return None
 
     def get_image_path(self, dataset_type, row_index):
-        """Get image path"""
-        image_dir = os.path.join(self.image_dir, dataset_type)
-        return os.path.join(image_dir, f"{row_index}.jpg")
+        return os.path.join(self.image_dir, dataset_type, f"{row_index}.jpg")
 
-    def extract_features(self, df, dataset_type='train', cache_file=None, 
-                        force_recompute=False, checkpoint_every=500):
-        """OPTIMIZED: Extract features with GPU acceleration"""
-        
+    def extract_features(self, df, dataset_type='train', cache_file=None, force_recompute=False, checkpoint_every=500):
         if cache_file and os.path.exists(cache_file) and not force_recompute:
-            print(f"   ✅ Loading cached image features from {cache_file}")
-            cached_features = pd.read_pickle(cache_file)
-            if len(cached_features) == len(df):
-                print(f"   ✅ Cache valid ({len(cached_features)} samples)")
-                return cached_features
+            print(f"   ✅ Loading cached features")
+            return pd.read_pickle(cache_file)
 
         checkpoint_file = cache_file.replace('.pkl', '_checkpoint.pkl') if cache_file else None
-        
-        # Try to load checkpoint
         processed_indices = set()
         checkpoint_features = {}
         start_idx = 0
         
-        if checkpoint_file and os.path.exists(checkpoint_file) and not force_recompute:
-            print(f"   📂 Found checkpoint: {checkpoint_file}")
+        if checkpoint_file and os.path.exists(checkpoint_file):
             try:
                 checkpoint_df = pd.read_pickle(checkpoint_file)
                 checkpoint_features = {idx: row.values for idx, row in checkpoint_df.iterrows()}
                 processed_indices = set(checkpoint_features.keys())
                 start_idx = len(processed_indices)
-                print(f"   ✅ Resuming from {start_idx}/{len(df)} images")
-            except Exception as e:
-                print(f"   ⚠️  Could not load checkpoint. Starting fresh...")
+                print(f"   📂 Resuming from {start_idx}/{len(df)}")
+            except:
+                pass
 
         self.download_images_batch(df, dataset_type)
 
         features_list = [None] * len(df)
         failed_count = 0
-        
-        est_time = (len(df) - start_idx) * 0.4 / 60
-        print(f"\n   🔄 Extracting features from {len(df) - start_idx} images...")
-        print(f"   ⏱️  Estimated time: ~{est_time:.1f} minutes")
-
-        processed_count = start_idx
         df_reset = df.reset_index(drop=True)
-        extraction_start = time.time()
-        
-        # OPTIMIZATION: Batch processing for GPU
-        batch_size = 32 if self.device.type == 'cuda' else 8
         
         for idx in tqdm(range(len(df_reset)), desc="   Processing", initial=start_idx):
             if idx in processed_indices:
@@ -337,34 +228,21 @@ class ImageFeatureExtractor:
                         features = self.model(img_tensor).squeeze().cpu().numpy()
 
                 features_list[idx] = features
-                processed_count += 1
                 
-                if checkpoint_file and processed_count % checkpoint_every == 0:
-                    temp_df = pd.DataFrame(
-                        [f for f in features_list if f is not None],
-                        columns=[f'img_feat_{i}' for i in range(2048)]
-                    )
+                if checkpoint_file and (idx + 1) % checkpoint_every == 0:
+                    temp_df = pd.DataFrame([f for f in features_list if f is not None], columns=[f'img_feat_{i}' for i in range(2048)])
                     temp_df.to_pickle(checkpoint_file)
-                    elapsed = (time.time() - extraction_start) / 60
-                    progress = (processed_count / len(df)) * 100
-                    print(f"\n   💾 Checkpoint: {processed_count}/{len(df)} ({progress:.1f}%) | {elapsed:.1f}min elapsed")
 
-            except Exception as e:
+            except:
                 features_list[idx] = np.zeros(2048)
                 failed_count += 1
-                if failed_count <= 3:
-                    print(f"\n   ⚠️  Error at index {idx}")
 
-        extraction_time = (time.time() - extraction_start) / 60
-        print(f"\n   ✅ Complete in {extraction_time:.1f}min. Failed: {failed_count}/{len(df)}")
-
+        print(f"\n   {'⚠️' if failed_count > 0 else '✅'} Failed: {failed_count}/{len(df)}")
         image_df = pd.DataFrame(features_list, columns=[f'img_feat_{i}' for i in range(2048)])
 
         if cache_file:
             os.makedirs(os.path.dirname(cache_file) or '.', exist_ok=True)
-            print(f"   💾 Saving cache to {cache_file}")
             image_df.to_pickle(cache_file)
-            
             if checkpoint_file and os.path.exists(checkpoint_file):
                 os.remove(checkpoint_file)
 
@@ -372,7 +250,7 @@ class ImageFeatureExtractor:
 
 
 class PricePredictionModel:
-    """OPTIMIZED: Better ensemble with improved hyperparameters"""
+    """Main prediction model"""
 
     def __init__(self, use_images=True, use_embeddings=True, fast_mode=False):
         self.use_images = use_images
@@ -382,121 +260,77 @@ class PricePredictionModel:
         if use_images:
             self.image_extractor = ImageFeatureExtractor()
 
-        # OPTIMIZATION: Use PowerTransformer for better normalization
         self.scaler = RobustScaler()
         self.models = None
 
     def _build_models(self, fast_mode=False):
-        """OPTIMIZED: Better ensemble configuration"""
+        """Build ensemble - FIXED: Simpler for faster CV"""
         if fast_mode:
-            print("   🔧 Using FAST MODE...")
-            base_models = [
-                ('lgb', LGBMRegressor(
-                    n_estimators=200,
-                    max_depth=8,
-                    learning_rate=0.08,
-                    num_leaves=50,
-                    subsample=0.85,
-                    colsample_bytree=0.85,
-                    reg_alpha=0.1,
-                    reg_lambda=0.1,
-                    random_state=42,
-                    n_jobs=-1,
-                    verbose=-1
-                ))
-            ]
-            meta_model = Ridge(alpha=5.0)
-            stacking_cv = 3
+            print("   🔧 FAST MODE (single LightGBM)")
+            # SINGLE MODEL - much faster for CV!
+            return LGBMRegressor(
+                n_estimators=200,
+                max_depth=8,
+                learning_rate=0.08,
+                num_leaves=50,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                random_state=42,
+                n_jobs=-1,  # Use all cores
+                verbose=-1
+            )
         else:
-            print("   🔧 Using OPTIMIZED FULL MODE...")
-            # IMPROVED: Better hyperparameters based on your data
+            print("   🔧 FULL MODE (4-model ensemble)")
             base_models = [
                 ('xgb', XGBRegressor(
-                    n_estimators=500,
-                    max_depth=8,
-                    learning_rate=0.03,
-                    subsample=0.85,
-                    colsample_bytree=0.85,
-                    reg_alpha=1.0,
-                    reg_lambda=2.0,
-                    gamma=0.1,
-                    min_child_weight=3,
-                    random_state=42,
-                    tree_method='hist',
-                    n_jobs=-1
+                    n_estimators=500, max_depth=8, learning_rate=0.03, subsample=0.85,
+                    colsample_bytree=0.85, reg_alpha=1.0, reg_lambda=2.0,
+                    random_state=42, tree_method='hist', n_jobs=-1
                 )),
                 ('lgb', LGBMRegressor(
-                    n_estimators=500,
-                    max_depth=8,
-                    learning_rate=0.03,
-                    num_leaves=60,
-                    subsample=0.85,
-                    colsample_bytree=0.85,
-                    reg_alpha=1.0,
-                    reg_lambda=2.0,
-                    min_child_samples=20,
-                    random_state=42,
-                    n_jobs=-1,
-                    verbose=-1
+                    n_estimators=500, max_depth=8, learning_rate=0.03, num_leaves=60,
+                    subsample=0.85, colsample_bytree=0.85, reg_alpha=1.0, reg_lambda=2.0,
+                    random_state=42, n_jobs=-1, verbose=-1
                 )),
                 ('cat', CatBoostRegressor(
-                    iterations=500,
-                    depth=8,
-                    learning_rate=0.03,
-                    l2_leaf_reg=3.0,
-                    random_seed=42,
-                    verbose=False
+                    iterations=500, depth=8, learning_rate=0.03,
+                    l2_leaf_reg=3.0, random_seed=42, verbose=False
                 )),
                 ('gbm', GradientBoostingRegressor(
-                    n_estimators=300,
-                    max_depth=7,
-                    learning_rate=0.05,
-                    subsample=0.85,
-                    random_state=42
+                    n_estimators=300, max_depth=7, learning_rate=0.05,
+                    subsample=0.85, random_state=42
                 ))
             ]
-            # IMPROVED: ElasticNet meta-model
             meta_model = ElasticNet(alpha=1.0, l1_ratio=0.5, max_iter=10000)
-            stacking_cv = 5
-
-        stacking = StackingRegressor(
-            estimators=base_models,
-            final_estimator=meta_model,
-            cv=stacking_cv,
-            n_jobs=-1
-        )
-
-        return stacking
+            
+            return StackingRegressor(
+                estimators=base_models,
+                final_estimator=meta_model,
+                cv=3,  # Reduced from 5 for speed
+                n_jobs=-1
+            )
 
     def calculate_smape(self, y_true, y_pred):
-        """Calculate SMAPE with progress feedback"""
-        print("   📊 Calculating SMAPE...")
-        smape = np.mean(np.abs(y_pred - y_true) / ((np.abs(y_true) + np.abs(y_pred)) / 2)) * 100
-        return smape
+        """Calculate SMAPE"""
+        return np.mean(np.abs(y_pred - y_true) / ((np.abs(y_true) + np.abs(y_pred)) / 2)) * 100
 
     def fit(self, train_df, validate=True):
-        """OPTIMIZED: Training with better progress feedback"""
+        """FIXED: Training with REAL fold-by-fold progress"""
         print("\n" + "="*60)
-        print("🚀 STARTING OPTIMIZED TRAINING PIPELINE")
+        print("🚀 STARTING TRAINING")
         print("="*60)
 
-        # Extract text features
-        print("\n[1/4] 📝 Extracting text features...")
-        text_start = time.time()
+        # Extract features
+        print("\n[1/4] 📝 Text features...")
         text_features = self.text_extractor.fit_transform(train_df['catalog_content'].values)
-        print(f"   ✅ Completed in {time.time() - text_start:.1f}s")
 
-        # Extract image features
         if self.use_images:
-            print(f"\n[2/4] 🖼️  Extracting image features...")
-            image_start = time.time()
+            print("\n[2/4] 🖼️  Image features...")
             image_features = self.image_extractor.extract_features(
-                train_df,
-                dataset_type='train',
+                train_df, dataset_type='train',
                 cache_file='cache/train_image_features.pkl',
                 checkpoint_every=500
             )
-            print(f"   ✅ Completed in {(time.time() - image_start)/60:.1f} minutes")
             X = pd.concat([text_features, image_features.set_index(text_features.index)], axis=1)
         else:
             X = text_features
@@ -506,163 +340,147 @@ class PricePredictionModel:
         y = train_df['price'].values
         y_log = np.log1p(y)
 
-        print(f"\n[3/4] ⚖️  Scaling features...")
-        scale_start = time.time()
+        print(f"\n[3/4] ⚖️  Scaling...")
         X_scaled = self.scaler.fit_transform(X)
-        print(f"   ✅ Completed in {time.time() - scale_start:.1f}s")
 
         if validate:
-            print(f"\n[3.5/4] 🔄 Running cross-validation...")
-            print(f"   ⏱️  Expected: 10-20 minutes")
-            print(f"   💡 Watch for fold progress below\n")
+            print(f"\n[3.5/4] 🔄 Cross-Validation (5-Fold)")
+            print("="*60)
             
-            cv_start = time.time()
-            cv_model = self._build_models(fast_mode=True)
+            # FIXED: Manual K-Fold with REAL progress
+            kf = KFold(n_splits=5, shuffle=True, random_state=42)
+            cv_model = self._build_models(fast_mode=True)  # Use fast single model
             
-            # IMPROVED: verbose=2 for fold-by-fold progress
-            cv_scores = cross_val_score(
-                cv_model, X_scaled, y_log,
-                cv=3,
-                scoring='neg_mean_absolute_error',
-                n_jobs=-1,
-                verbose=2  # Shows progress per fold
-            )
+            fold_scores_mae = []
+            fold_scores_smape = []
             
-            cv_time = (time.time() - cv_start) / 60
-            print(f"\n   ✅ CV completed in {cv_time:.1f} minutes")
-            print(f"   📊 CV MAE (log): {-cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+            for fold_num, (train_idx, val_idx) in enumerate(kf.split(X_scaled), 1):
+                fold_start = time.time()
+                print(f"\n📍 Fold {fold_num}/5:")
+                
+                X_train_fold, X_val_fold = X_scaled[train_idx], X_scaled[val_idx]
+                y_train_fold, y_val_fold = y_log[train_idx], y_log[val_idx]
+                
+                # Train
+                print(f"   🏋️  Training...", end='', flush=True)
+                cv_model.fit(X_train_fold, y_train_fold)
+                print(" ✅")
+                
+                # Predict
+                print(f"   🎯 Predicting...", end='', flush=True)
+                y_pred_log = cv_model.predict(X_val_fold)
+                y_pred = np.expm1(y_pred_log)
+                y_val_real = np.expm1(y_val_fold)
+                print(" ✅")
+                
+                # Metrics
+                mae = mean_absolute_error(y_val_real, y_pred)
+                smape = self.calculate_smape(y_val_real, y_pred)
+                
+                fold_scores_mae.append(mae)
+                fold_scores_smape.append(smape)
+                
+                fold_time = time.time() - fold_start
+                print(f"   📊 MAE: ${mae:.2f} | SMAPE: {smape:.2f}% | Time: {fold_time:.0f}s")
             
-            # Convert to SMAPE estimate
-            estimated_smape = (-cv_scores.mean()) * 100
-            print(f"   📊 Estimated SMAPE: ~{estimated_smape:.2f}%")
+            # Summary
+            print("\n" + "="*60)
+            print("📊 CROSS-VALIDATION RESULTS:")
+            print("="*60)
+            print(f"SMAPE: {np.mean(fold_scores_smape):.2f}% (±{np.std(fold_scores_smape):.2f}%)")
+            print(f"MAE:   ${np.mean(fold_scores_mae):.2f} (±${np.std(fold_scores_mae):.2f})")
+            print(f"Range: {np.min(fold_scores_smape):.2f}% - {np.max(fold_scores_smape):.2f}%")
+            print("="*60)
 
+        # Train final model
         print(f"\n[4/4] 🏋️  Training final model...")
-        print(f"   ⏱️  Expected: {'5-10' if self.fast_mode else '20-40'} minutes")
+        print(f"   ⏱️  Expected: {'3-5' if self.fast_mode else '15-30'} min")
         
         train_start = time.time()
         self.models = self._build_models(fast_mode=self.fast_mode)
-        print(f"   🔄 Fitting ensemble...")
+        print(f"   🔄 Fitting...")
         self.models.fit(X_scaled, y_log)
         train_time = (time.time() - train_start) / 60
         
-        print(f"\n   ✅ Training completed in {train_time:.1f} minutes")
+        print(f"\n   ✅ Training done in {train_time:.1f}min")
 
-        # Calculate training metrics with progress
-        print(f"\n   📊 Evaluating training performance...")
+        # Training metrics
         train_pred = np.expm1(self.models.predict(X_scaled))
         train_smape = self.calculate_smape(y, train_pred)
         print(f"   📊 Training SMAPE: {train_smape:.2f}%")
-        
-        # Additional metrics
-        train_mae = np.mean(np.abs(y - train_pred))
-        train_rmse = np.sqrt(np.mean((y - train_pred) ** 2))
-        print(f"   📊 Training MAE: ${train_mae:.2f}")
-        print(f"   📊 Training RMSE: ${train_rmse:.2f}")
 
         print("\n" + "="*60)
         print("✅ TRAINING COMPLETE!")
         print("="*60)
 
     def predict(self, test_df):
-        """Make predictions with progress feedback"""
+        """Make predictions"""
         print("\n" + "="*60)
-        print("🚀 STARTING PREDICTION PIPELINE")
+        print("🚀 PREDICTION")
         print("="*60)
 
-        print("\n[1/3] 📝 Extracting text features...")
-        text_start = time.time()
+        print("\n📝 Text features...")
         text_features = self.text_extractor.transform(test_df['catalog_content'].values)
-        print(f"   ✅ Completed in {time.time() - text_start:.1f}s")
 
         if self.use_images:
-            print(f"\n[2/3] 🖼️  Extracting image features...")
-            image_start = time.time()
+            print("🖼️  Image features...")
             image_features = self.image_extractor.extract_features(
-                test_df,
-                dataset_type='test',
+                test_df, dataset_type='test',
                 cache_file='cache/test_image_features.pkl',
                 checkpoint_every=500
             )
-            print(f"   ✅ Completed in {(time.time() - image_start)/60:.1f} minutes")
             X = pd.concat([text_features, image_features.set_index(text_features.index)], axis=1)
         else:
             X = text_features
 
-        print(f"\n[3/3] 🎯 Making predictions...")
-        pred_start = time.time()
+        print("🎯 Predicting...")
         X_scaled = self.scaler.transform(X)
         predictions = np.expm1(self.models.predict(X_scaled))
         predictions = np.maximum(predictions, 0.01)
-        print(f"   ✅ Predictions complete in {time.time() - pred_start:.1f}s")
 
-        print("\n" + "="*60)
-        print("✅ PREDICTION COMPLETE!")
-        print("="*60)
-
+        print("✅ Done!")
         return predictions
 
     def save(self, filepath='models/model.pkl'):
-        """Save model to disk"""
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
         with open(filepath, 'wb') as f:
             pickle.dump(self, f)
-        print(f"💾 Model saved to {filepath}")
+        print(f"💾 Saved: {filepath}")
 
     @staticmethod
     def load(filepath='models/model.pkl'):
-        """Load model from disk"""
         with open(filepath, 'rb') as f:
-            model = pickle.load(f)
-        print(f"📂 Model loaded from {filepath}")
-        return model
+            return pickle.load(f)
 
 
 def main():
-    """Main execution function"""
-
-    # ===== CONFIGURATION =====
-    USE_IMAGES = True
+    # Configuration
+    USE_IMAGES = False  # Set True if images work
     USE_EMBEDDINGS = True
     VALIDATE = True
-    FAST_MODE = False  # Set to True for quick testing
+    FAST_MODE = False
     
-    # ===== PATHS =====
     TRAIN_PATH = 'Data/student_resource/dataset/train.csv'
     TEST_PATH = 'Data/student_resource/dataset/test.csv'
     OUTPUT_PATH = 'submissions/test_out.csv'
-    MODEL_PATH = 'models/price_prediction_model_optimized.pkl'
-    # =========================
+    MODEL_PATH = 'models/model_fixed.pkl'
 
-    # Create directories
     os.makedirs('cache', exist_ok=True)
     os.makedirs('models', exist_ok=True)
     os.makedirs('submissions', exist_ok=True)
 
     print("\n" + "="*60)
-    print("SMART PRODUCT PRICING - OPTIMIZED ML PIPELINE")
+    print("SMART PRODUCT PRICING - FIXED")
     print("="*60)
-    print(f"Configuration:")
-    print(f"  - Use Images: {USE_IMAGES}")
-    print(f"  - Use Embeddings: {USE_EMBEDDINGS}")
-    print(f"  - Validate: {VALIDATE}")
-    print(f"  - Fast Mode: {FAST_MODE}")
-    print(f"  - GPU Available: {torch.cuda.is_available()}")
-    print(f"  - Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Images: {USE_IMAGES} | Embeddings: {USE_EMBEDDINGS}")
+    print(f"GPU: {torch.cuda.is_available()} | Fast: {FAST_MODE}")
     
-    # Load data
     print("\n📂 Loading data...")
-    try:
-        train_df = pd.read_csv(TRAIN_PATH)
-        test_df = pd.read_csv(TEST_PATH)
-    except FileNotFoundError as e:
-        print(f"❌ Error: {e.filename} not found")
-        return
-
-    print(f"  ✅ Training samples: {len(train_df):,}")
-    print(f"  ✅ Test samples: {len(test_df):,}")
+    train_df = pd.read_csv(TRAIN_PATH)
+    test_df = pd.read_csv(TEST_PATH)
+    print(f"  Train: {len(train_df):,} | Test: {len(test_df):,}")
     
-    # Initialize and train model
-    pipeline_start = time.time()
+    start_time = time.time()
     
     model = PricePredictionModel(
         use_images=USE_IMAGES,
@@ -672,30 +490,23 @@ def main():
     model.fit(train_df, validate=VALIDATE)
     model.save(MODEL_PATH)
 
-    # Predict
     predictions = model.predict(test_df)
 
-    # Create submission
     submission = pd.DataFrame({
         'sample_id': test_df['sample_id'],
         'price': predictions
     })
 
-    pipeline_time = (time.time() - pipeline_start) / 60
+    total_time = (time.time() - start_time) / 60
 
     print("\n" + "="*60)
-    print("📊 SUBMISSION STATISTICS")
+    print("📊 RESULTS")
     print("="*60)
     print(submission['price'].describe())
-    print(f"\n⏱️  Total time: {pipeline_time:.1f} minutes")
+    print(f"\n⏱️  Total: {total_time:.1f}min")
 
     submission.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n✅ Submission saved: {OUTPUT_PATH}")
-    print("="*60)
-    print("\n💡 TIP: If SMAPE is still >30%, consider:")
-    print("   - Feature engineering on price-related keywords")
-    print("   - Ensemble different model types")
-    print("   - Tune hyperparameters further")
+    print(f"✅ Saved: {OUTPUT_PATH}")
     print("="*60)
 
 
