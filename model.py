@@ -491,8 +491,8 @@ def main():
     FAST_MODE = False       # Use smaller models for quick testing. Set to False for best performance.
     
     # ===== PATHS =====
-    TRAIN_PATH = 'dataset/train.csv'
-    TEST_PATH = 'dataset/test.csv'
+    TRAIN_PATH = 'Data/student_resource/dataset/train.csv'
+    TEST_PATH = 'Data/student_resource/dataset/test.csv'
     OUTPUT_PATH = 'test_out.csv'
     # =========================
 
