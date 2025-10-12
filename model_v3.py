@@ -1,3 +1,40 @@
+import pandas as pd
+import numpy as np
+import os
+import pickle
+import warnings
+from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
+import logging
+from tqdm import tqdm
+import hashlib
+import json
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+import xgboost as xgb
+import lightgbm as lgb
+from gensim.models import Word2Vec
+from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+from PIL import Image
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+import optuna
+
+# Configure warnings and logging
+warnings.filterwarnings('ignore')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 def train(self, optimize: bool = True):
         """Train the complete pipeline"""
         logger.info("\n")
