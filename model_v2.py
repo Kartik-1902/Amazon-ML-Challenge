@@ -56,7 +56,7 @@ class Config:
     # ==================== OUTPUT & CACHE PATHS ====================
     OUTPUT_CSV = "test_out.csv"
     MODEL_SAVE_PATH = "models"
-    CACHE_PATH = "cache"
+    CACHE_PATH = "cache_testing"
     
     # Model Selection
     NLP_MODEL = "glove"  # Options: "word2vec", "glove", "tfidf"
