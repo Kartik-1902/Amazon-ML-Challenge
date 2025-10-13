@@ -54,13 +54,13 @@ class Config:
     TEST_IMAGES = "images/test"
     
     # ==================== OUTPUT & CACHE PATHS ====================
-    OUTPUT_CSV = "test_out.csv"
+    OUTPUT_CSV = "submission/test_out.csv"
     MODEL_SAVE_PATH = "models"
     CACHE_PATH = "cache_testing"
     CACHE_PATH_HP = "cache"
     
     # Model Selection
-    NLP_MODEL = "glove"  # Options: "word2vec", "glove", "tfidf"
+    NLP_MODEL = "tfidf"  # Options: "word2vec", "glove", "tfidf"
     IMAGE_MODEL = "resnet"  # Options: "resnet", "cnn"
     REGRESSION_MODEL = "xgboost"  # Options: "linear", "ridge", "lasso", "svm", "rf", "xgboost", "lightgbm"
     
