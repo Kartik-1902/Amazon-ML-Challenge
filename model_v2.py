@@ -50,13 +50,14 @@ class Config:
     TEST_CSV = "Data/student_resource/dataset/test.csv"
     
     # ==================== IMAGE PATHS ====================
-    TRAIN_IMAGES = "image/train"
-    TEST_IMAGES = "image/test"
+    TRAIN_IMAGES = "images/train"
+    TEST_IMAGES = "images/test"
     
     # ==================== OUTPUT & CACHE PATHS ====================
     OUTPUT_CSV = "test_out.csv"
     MODEL_SAVE_PATH = "models"
     CACHE_PATH = "cache_testing"
+    CACHE_PATH_HP = "cache"
     
     # Model Selection
     NLP_MODEL = "glove"  # Options: "word2vec", "glove", "tfidf"
@@ -470,7 +471,7 @@ class RegressionModel:
     
     def _get_hyperparams_cache_filename(self) -> str:
         """Generate cache filename for hyperparameters"""
-        return os.path.join(Config.CACHE_PATH, f"hyperparams_{self.model_type}.json")
+        return os.path.join(Config.CACHE_PATH_HP, f"hyperparams_{self.model_type}.json")
     
     def fit(self, X: np.ndarray, y: np.ndarray):
         """Fit the regression model"""

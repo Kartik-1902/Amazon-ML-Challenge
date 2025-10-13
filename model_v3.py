@@ -50,8 +50,8 @@ class Config:
     TEST_CSV = "Data/student_resource/dataset/test.csv"
     
     # ==================== IMAGE PATHS ====================
-    TRAIN_IMAGES = "image/train"
-    TEST_IMAGES = "image/test"
+    TRAIN_IMAGES = "images/train"
+    TEST_IMAGES = "images/test"
     
     # ==================== OUTPUT & CACHE PATHS ====================
     OUTPUT_CSV = "test_out.csv"
