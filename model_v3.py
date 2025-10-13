@@ -70,7 +70,7 @@ class Config:
     
     # Feature Dimensions
     TEXT_FEATURE_DIM = 300
-    IMAGE_FEATURE_DIM = 512
+    IMAGE_FEATURE_DIM = 2048
     
     # Caching Options
     USE_CACHE = True
@@ -207,7 +207,7 @@ class ImageFeatureExtractor:
     def _build_model(self) -> nn.Module:
         """Build image feature extraction model"""
         if self.model_type == "resnet":
-            model = models.resnet18(pretrained=True)
+            model = models.resnet152(pretrained=True)
             # Remove final classification layer
             self.model = nn.Sequential(*list(model.children())[:-1])
         elif self.model_type == "cnn":
