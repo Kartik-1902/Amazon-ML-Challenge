@@ -71,7 +71,7 @@ class Config:
     
     # Feature Dimensions
     TEXT_FEATURE_DIM = 100
-    IMAGE_FEATURE_DIM = 128
+    IMAGE_FEATURE_DIM = 2048
     
     # Caching Options
     USE_CACHE = True
