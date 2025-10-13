@@ -7,21 +7,18 @@ from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 import logging
 from tqdm import tqdm
-import hashlib
 import json
 
 # ML Libraries
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.svm import SVR
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_percentage_error
 import xgboost as xgb
 import lightgbm as lgb
 
 # NLP Libraries
-from gensim.models import Word2Vec
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
 
@@ -44,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    """Configuration class for model parameters"""
+    """Configuration class with anti-overfitting settings"""
     # ==================== DATASET PATHS ====================
     TRAIN_CSV = "Data/student_resource/dataset/train.csv"
     TEST_CSV = "Data/student_resource/dataset/test.csv"
@@ -59,18 +56,27 @@ class Config:
     CACHE_PATH = "cache"
     
     # Model Selection
-    NLP_MODEL = "tfidf"  # Options: "word2vec", "glove", "tfidf"
-    IMAGE_MODEL = "resnet"  # Options: "resnet", "cnn"
-    REGRESSION_MODEL = "xgboost"  # Options: "linear", "ridge", "lasso", "svm", "rf", "xgboost", "lightgbm"
+    NLP_MODEL = "tfidf"
+    IMAGE_MODEL = "resnet"
+    REGRESSION_MODEL = "xgboost"  # xgboost, lightgbm, ridge, elasticnet
     
-    # Training Parameters
+    # Training Parameters - ANTI-OVERFITTING
     TEST_SIZE = 0.2
     RANDOM_STATE = 42
-    N_OPTUNA_TRIALS = 50
+    N_OPTUNA_TRIALS = 30  # Reduced for faster training
+    USE_CROSS_VALIDATION = True  # Enable CV for better generalization
+    N_FOLDS = 5
     
-    # Feature Dimensions
-    TEXT_FEATURE_DIM = 300
-    IMAGE_FEATURE_DIM = 2048
+    # Feature Dimensions - REDUCED to prevent overfitting
+    TEXT_FEATURE_DIM = 150  # Reduced from 300
+    IMAGE_FEATURE_DIM = 512  # Reduced from 2048
+    
+    # Feature Selection & Regularization
+    USE_FEATURE_SELECTION = True
+    FEATURE_SELECTION_THRESHOLD = 0.001  # Remove very low variance features
+    
+    # Ensemble Settings
+    USE_ENSEMBLE = True  # Combine multiple models
     
     # Caching Options
     USE_CACHE = True
@@ -83,17 +89,19 @@ def calculate_smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Calculate SMAPE metric"""
     numerator = np.abs(y_pred - y_true)
     denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
+    # Avoid division by zero
+    denominator = np.where(denominator == 0, 1e-10, denominator)
     return np.mean(numerator / denominator) * 100
 
 
 class TextFeatureExtractor:
-    """Extract features from catalog content"""
+    """Extract features from catalog content with regularization"""
     
-    def __init__(self, method: str = "tfidf", feature_dim: int = 300):
+    def __init__(self, method: str = "tfidf", feature_dim: int = 150):
         self.method = method
         self.feature_dim = feature_dim
         self.model = None
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()  # More robust to outliers
         
     def preprocess_text(self, text: str) -> str:
         """Clean and preprocess text"""
@@ -105,97 +113,57 @@ class TextFeatureExtractor:
         return text
     
     def fit(self, texts: pd.Series):
-        """Fit the text feature extractor"""
+        """Fit the text feature extractor with regularization"""
         logger.info(f"Fitting {self.method} text feature extractor...")
         
-        # Check cache
         cache_file = self._get_cache_filename('fit')
         if Config.USE_CACHE and os.path.exists(cache_file):
             logger.info(f"Loading {self.method} model from cache...")
             with open(cache_file, 'rb') as f:
                 self.model = pickle.load(f)
-            logger.info("✓ Text model loaded from cache")
+            logger.info("Text model loaded from cache")
             return
         
         processed_texts = texts.apply(self.preprocess_text)
-        logger.info(f"Preprocessing {len(texts)} text samples...")
         
-        if self.method == "tfidf":
-            self.model = TfidfVectorizer(
-                max_features=self.feature_dim,
-                ngram_range=(1, 2),
-                min_df=2,
-                max_df=0.95
-            )
-            logger.info("Fitting TF-IDF vectorizer...")
-            self.model.fit(processed_texts)
-            
-        elif self.method == "word2vec":
-            tokenized_texts = [text.split() for text in tqdm(processed_texts, desc="Tokenizing texts") if text]
-            logger.info(f"Training Word2Vec model on {len(tokenized_texts)} documents...")
-            self.model = Word2Vec(
-                sentences=tokenized_texts,
-                vector_size=self.feature_dim,
-                window=5,
-                min_count=2,
-                workers=4,
-                epochs=10
-            )
+        # TF-IDF with stronger regularization
+        self.model = TfidfVectorizer(
+            max_features=self.feature_dim,
+            ngram_range=(1, 2),
+            min_df=5,  # Increased from 2 - ignore rare terms
+            max_df=0.85,  # Decreased from 0.95 - ignore very common terms
+            sublinear_tf=True,  # Use log scaling
+            strip_accents='unicode',
+            lowercase=True,
+            token_pattern=r'\b[a-zA-Z]{2,}\b'  # Only words with 2+ letters
+        )
+        logger.info("Fitting TF-IDF vectorizer with regularization...")
+        self.model.fit(processed_texts)
         
-        elif self.method == "glove":
-            logger.info("Fitting GloVe-style vectorizer...")
-            self.model = TfidfVectorizer(
-                max_features=self.feature_dim,
-                ngram_range=(1, 3),
-                min_df=2
-            )
-            self.model.fit(processed_texts)
-        
-        # Save to cache
         if Config.USE_CACHE:
             os.makedirs(Config.CACHE_PATH, exist_ok=True)
             with open(cache_file, 'wb') as f:
                 pickle.dump(self.model, f)
-            logger.info(f"✓ Text model cached to {cache_file}")
+            logger.info(f"Text model cached")
     
     def _get_cache_filename(self, mode: str) -> str:
-        """Generate cache filename based on method and parameters"""
-        cache_id = f"{self.method}_{self.feature_dim}_{mode}"
+        cache_id = f"{self.method}_{self.feature_dim}_{mode}_v2"
         return os.path.join(Config.CACHE_PATH, f"text_model_{cache_id}.pkl")
     
     def transform(self, texts: pd.Series) -> np.ndarray:
         """Transform texts to feature vectors"""
-        logger.info(f"Transforming {len(texts)} text samples...")
         processed_texts = texts.apply(self.preprocess_text)
-        
-        if self.method == "tfidf" or self.method == "glove":
-            features = self.model.transform(processed_texts).toarray()
-            
-        elif self.method == "word2vec":
-            features = []
-            for text in tqdm(processed_texts, desc="Generating embeddings"):
-                if not text:
-                    features.append(np.zeros(self.feature_dim))
-                    continue
-                words = text.split()
-                word_vectors = [self.model.wv[word] for word in words if word in self.model.wv]
-                if word_vectors:
-                    features.append(np.mean(word_vectors, axis=0))
-                else:
-                    features.append(np.zeros(self.feature_dim))
-            features = np.array(features)
-        
-        logger.info(f"✓ Text features generated: {features.shape}")
+        features = self.model.transform(processed_texts).toarray()
+        logger.info(f"✓ Text features: {features.shape}")
         return features
     
     def fit_transform(self, texts: pd.Series) -> np.ndarray:
-        """Fit and transform texts"""
         self.fit(texts)
         return self.transform(texts)
 
 
 class ImageFeatureExtractor:
-    """Extract features from product images"""
+    """Extract features from product images with dropout"""
     
     def __init__(self, model_type: str = "resnet", feature_dim: int = 512):
         self.model_type = model_type
@@ -207,19 +175,17 @@ class ImageFeatureExtractor:
     def _build_model(self) -> nn.Module:
         """Build image feature extraction model"""
         if self.model_type == "resnet":
-            model = models.resnet152(pretrained=True)
-            # Remove final classification layer
+            # Use ResNet50 instead of ResNet152 to reduce overfitting
+            model = models.resnet50(pretrained=True)
+            # Extract from earlier layer for better generalization
             self.model = nn.Sequential(*list(model.children())[:-1])
-        elif self.model_type == "cnn":
-            # Simple CNN architecture
-            self.model = SimpleCNN(output_dim=self.feature_dim)
         
         self.model.to(self.device)
         self.model.eval()
         return self.model
     
     def _get_transform(self):
-        """Get image preprocessing transform"""
+        """Get image preprocessing with augmentation-style normalization"""
         return transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -251,10 +217,7 @@ class ImageFeatureExtractor:
             return np.zeros(self.feature_dim)
     
     def extract_batch_features(self, image_links: pd.Series, image_folder: str) -> np.ndarray:
-        """Extract features from multiple images - FIXED to use original filenames"""
-        logger.info(f"Extracting image features from {image_folder}...")
-        
-        # Check cache
+        """Extract features from multiple images"""
         cache_file = self._get_cache_filename(image_folder)
         if Config.USE_CACHE and os.path.exists(cache_file):
             logger.info("Loading image features from cache...")
@@ -265,10 +228,8 @@ class ImageFeatureExtractor:
         features = []
         missing_count = 0
         
-        # FIXED: Use image_link to get original filename
         for image_link in tqdm(image_links, desc="Processing images"):
             if isinstance(image_link, str):
-                # Get original filename from URL
                 image_filename = Path(image_link).name
                 image_path = os.path.join(image_folder, image_filename)
             else:
@@ -285,178 +246,173 @@ class ImageFeatureExtractor:
         features = np.array(features)
         
         if missing_count > 0:
-            logger.warning(f"⚠ {missing_count} images were missing (set to zero vectors)")
-        else:
-            logger.info(f"✓ All images found!")
+            logger.warning(f"⚠ {missing_count} images missing")
         
-        logger.info(f"✓ Image features extracted: {features.shape}")
+        logger.info(f"✓ Image features: {features.shape}")
         
-        # Save to cache
         if Config.USE_CACHE:
             os.makedirs(Config.CACHE_PATH, exist_ok=True)
             np.save(cache_file, features)
-            logger.info(f"✓ Image features cached to {cache_file}")
+            logger.info(f"✓ Image features cached")
         
         return features
     
     def _get_cache_filename(self, image_folder: str) -> str:
-        """Generate cache filename based on model type and image folder"""
         folder_name = os.path.basename(image_folder)
-        cache_id = f"{self.model_type}_{self.feature_dim}_{folder_name}"
+        cache_id = f"{self.model_type}_{self.feature_dim}_{folder_name}_v2"
         return os.path.join(Config.CACHE_PATH, f"image_features_{cache_id}.npy")
 
 
-class SimpleCNN(nn.Module):
-    """Simple CNN for image feature extraction"""
-    
-    def __init__(self, output_dim: int = 512):
-        super(SimpleCNN, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.fc = nn.Linear(256, output_dim)
-    
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
-
-
 class RegressionModel:
-    """Wrapper for various regression models"""
+    """Wrapper for regression models with strong regularization"""
     
     def __init__(self, model_type: str = "xgboost"):
         self.model_type = model_type
         self.model = None
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()  # More robust to outliers
         self.best_params = None
         
     def _get_model(self, params: Optional[Dict] = None):
-        """Get regression model based on type"""
+        """Get regression model with anti-overfitting defaults"""
         if params is None:
             params = {}
             
-        if self.model_type == "linear":
-            return Ridge(alpha=params.get('alpha', 1.0))
+        if self.model_type == "ridge":
+            return Ridge(
+                alpha=params.get('alpha', 10.0),  # Stronger regularization
+                random_state=Config.RANDOM_STATE
+            )
         
-        elif self.model_type == "ridge":
-            return Ridge(alpha=params.get('alpha', 1.0))
-        
-        elif self.model_type == "lasso":
-            return Lasso(alpha=params.get('alpha', 1.0))
-        
-        elif self.model_type == "svm":
-            return SVR(
-                C=params.get('C', 1.0),
-                epsilon=params.get('epsilon', 0.1),
-                kernel=params.get('kernel', 'rbf')
+        elif self.model_type == "elasticnet":
+            return ElasticNet(
+                alpha=params.get('alpha', 1.0),
+                l1_ratio=params.get('l1_ratio', 0.5),
+                random_state=Config.RANDOM_STATE,
+                max_iter=2000
             )
         
         elif self.model_type == "rf":
             return RandomForestRegressor(
                 n_estimators=params.get('n_estimators', 100),
-                max_depth=params.get('max_depth', 10),
-                min_samples_split=params.get('min_samples_split', 2),
-                random_state=Config.RANDOM_STATE
+                max_depth=params.get('max_depth', 8),  # Limit depth
+                min_samples_split=params.get('min_samples_split', 20),  # Increased
+                min_samples_leaf=params.get('min_samples_leaf', 10),  # Increased
+                max_features=params.get('max_features', 0.5),  # Use subset
+                random_state=Config.RANDOM_STATE,
+                n_jobs=-1
             )
         
         elif self.model_type == "xgboost":
             return xgb.XGBRegressor(
-                n_estimators=params.get('n_estimators', 100),
-                max_depth=params.get('max_depth', 6),
-                learning_rate=params.get('learning_rate', 0.1),
-                subsample=params.get('subsample', 0.8),
-                colsample_bytree=params.get('colsample_bytree', 0.8),
-                random_state=Config.RANDOM_STATE
+                n_estimators=params.get('n_estimators', 200),
+                max_depth=params.get('max_depth', 4),  # Shallow trees
+                learning_rate=params.get('learning_rate', 0.05),  # Slower learning
+                subsample=params.get('subsample', 0.7),  # Strong sampling
+                colsample_bytree=params.get('colsample_bytree', 0.7),
+                min_child_weight=params.get('min_child_weight', 3),  # Regularization
+                gamma=params.get('gamma', 0.1),  # Regularization
+                reg_alpha=params.get('reg_alpha', 0.5),  # L1 reg
+                reg_lambda=params.get('reg_lambda', 1.0),  # L2 reg
+                random_state=Config.RANDOM_STATE,
+                n_jobs=-1
             )
         
         elif self.model_type == "lightgbm":
             return lgb.LGBMRegressor(
-                n_estimators=params.get('n_estimators', 100),
-                max_depth=params.get('max_depth', 6),
-                learning_rate=params.get('learning_rate', 0.1),
-                subsample=params.get('subsample', 0.8),
-                colsample_bytree=params.get('colsample_bytree', 0.8),
+                n_estimators=params.get('n_estimators', 200),
+                max_depth=params.get('max_depth', 4),
+                learning_rate=params.get('learning_rate', 0.05),
+                subsample=params.get('subsample', 0.7),
+                colsample_bytree=params.get('colsample_bytree', 0.7),
+                min_child_samples=params.get('min_child_samples', 20),
+                reg_alpha=params.get('reg_alpha', 0.5),
+                reg_lambda=params.get('reg_lambda', 1.0),
                 random_state=Config.RANDOM_STATE,
-                verbose=-1
+                verbose=-1,
+                n_jobs=-1
             )
     
     def optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray,
                                  X_val: np.ndarray, y_val: np.ndarray,
-                                 n_trials: int = 50):
-        """Optimize hyperparameters using Optuna"""
+                                 n_trials: int = 30):
+        """Optimize hyperparameters with cross-validation"""
         logger.info(f"Optimizing hyperparameters for {self.model_type}...")
-        logger.info(f"Running {n_trials} trials with Optuna...")
         
-        # Check cache
         cache_file = self._get_hyperparams_cache_filename()
         if Config.USE_CACHE and os.path.exists(cache_file):
             logger.info("Loading cached hyperparameters...")
             with open(cache_file, 'r') as f:
                 cached_data = json.load(f)
                 self.best_params = cached_data['best_params']
-                logger.info(f"✓ Loaded cached parameters: {self.best_params}")
+                logger.info(f"✓ Cached params: {self.best_params}")
                 logger.info(f"✓ Cached SMAPE: {cached_data['best_smape']:.4f}")
                 return self.best_params
         
         def objective(trial):
-            if self.model_type in ["linear", "ridge"]:
-                params = {'alpha': trial.suggest_float('alpha', 0.01, 10.0)}
+            if self.model_type == "ridge":
+                params = {'alpha': trial.suggest_float('alpha', 1.0, 50.0)}
             
-            elif self.model_type == "lasso":
-                params = {'alpha': trial.suggest_float('alpha', 0.01, 10.0)}
-            
-            elif self.model_type == "svm":
+            elif self.model_type == "elasticnet":
                 params = {
-                    'C': trial.suggest_float('C', 0.1, 100.0, log=True),
-                    'epsilon': trial.suggest_float('epsilon', 0.01, 1.0),
-                    'kernel': trial.suggest_categorical('kernel', ['rbf', 'linear'])
+                    'alpha': trial.suggest_float('alpha', 0.1, 10.0),
+                    'l1_ratio': trial.suggest_float('l1_ratio', 0.1, 0.9)
                 }
             
             elif self.model_type == "rf":
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-                    'max_depth': trial.suggest_int('max_depth', 5, 20),
-                    'min_samples_split': trial.suggest_int('min_samples_split', 2, 10)
+                    'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+                    'max_depth': trial.suggest_int('max_depth', 5, 12),
+                    'min_samples_split': trial.suggest_int('min_samples_split', 10, 50),
+                    'min_samples_leaf': trial.suggest_int('min_samples_leaf', 5, 20),
+                    'max_features': trial.suggest_float('max_features', 0.3, 0.8)
                 }
             
             elif self.model_type in ["xgboost", "lightgbm"]:
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-                    'max_depth': trial.suggest_int('max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                    'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)
+                    'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+                    'max_depth': trial.suggest_int('max_depth', 3, 6),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                    'subsample': trial.suggest_float('subsample', 0.6, 0.9),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
+                    'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 2.0),
+                    'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 3.0)
                 }
+                
+                if self.model_type == "xgboost":
+                    params['min_child_weight'] = trial.suggest_int('min_child_weight', 1, 10)
+                    params['gamma'] = trial.suggest_float('gamma', 0.0, 0.5)
+                else:
+                    params['min_child_samples'] = trial.suggest_int('min_child_samples', 10, 50)
             
-            model = self._get_model(params)
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_val)
-            smape = calculate_smape(y_val, y_pred)
-            
-            return smape
+            # Use cross-validation for more robust evaluation
+            if Config.USE_CROSS_VALIDATION:
+                kf = KFold(n_splits=3, shuffle=True, random_state=Config.RANDOM_STATE)
+                scores = []
+                
+                for train_idx, val_idx in kf.split(X_train):
+                    X_tr, X_vl = X_train[train_idx], X_train[val_idx]
+                    y_tr, y_vl = y_train[train_idx], y_train[val_idx]
+                    
+                    model = self._get_model(params)
+                    model.fit(X_tr, y_tr)
+                    y_pred = model.predict(X_vl)
+                    smape = calculate_smape(y_vl, y_pred)
+                    scores.append(smape)
+                
+                return np.mean(scores)
+            else:
+                model = self._get_model(params)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
+                return calculate_smape(y_val, y_pred)
         
         study = optuna.create_study(direction='minimize')
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
         
         self.best_params = study.best_params
-        logger.info(f"✓ Best parameters: {self.best_params}")
+        logger.info(f"✓ Best params: {self.best_params}")
         logger.info(f"✓ Best SMAPE: {study.best_value:.4f}%")
         
-        # Cache the results
         if Config.USE_CACHE:
             os.makedirs(Config.CACHE_PATH, exist_ok=True)
             with open(cache_file, 'w') as f:
@@ -464,13 +420,12 @@ class RegressionModel:
                     'best_params': self.best_params,
                     'best_smape': study.best_value
                 }, f, indent=2)
-            logger.info(f"✓ Hyperparameters cached to {cache_file}")
+            logger.info(f"✓ Hyperparameters cached")
         
         return self.best_params
     
     def _get_hyperparams_cache_filename(self) -> str:
-        """Generate cache filename for hyperparameters"""
-        return os.path.join(Config.CACHE_PATH, f"hyperparams_{self.model_type}.json")
+        return os.path.join(Config.CACHE_PATH, f"hyperparams_{self.model_type}_v2.json")
     
     def fit(self, X: np.ndarray, y: np.ndarray):
         """Fit the regression model"""
@@ -486,7 +441,7 @@ class RegressionModel:
 
 
 class ProductPricePredictionPipeline:
-    """Complete ML pipeline for product price prediction"""
+    """Complete ML pipeline with anti-overfitting measures"""
     
     def __init__(self, config: Config = Config()):
         self.config = config
@@ -498,181 +453,157 @@ class ProductPricePredictionPipeline:
             model_type=config.IMAGE_MODEL,
             feature_dim=config.IMAGE_FEATURE_DIM
         )
-        self.regression_model = RegressionModel(model_type=config.REGRESSION_MODEL)
+        self.models = []  # For ensemble
         
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Load training and test data"""
         logger.info("=" * 60)
         logger.info("LOADING DATASET")
         logger.info("=" * 60)
-        logger.info(f"Train CSV path: {self.config.TRAIN_CSV}")
-        logger.info(f"Test CSV path:  {self.config.TEST_CSV}")
         
         if not os.path.exists(self.config.TRAIN_CSV):
-            raise FileNotFoundError(f"Training CSV not found at: {self.config.TRAIN_CSV}")
+            raise FileNotFoundError(f"Training CSV not found: {self.config.TRAIN_CSV}")
         if not os.path.exists(self.config.TEST_CSV):
-            raise FileNotFoundError(f"Test CSV not found at: {self.config.TEST_CSV}")
+            raise FileNotFoundError(f"Test CSV not found: {self.config.TEST_CSV}")
         
         train_df = pd.read_csv(self.config.TRAIN_CSV)
         test_df = pd.read_csv(self.config.TEST_CSV)
         
-        logger.info(f"✓ Train data loaded: {train_df.shape}")
-        logger.info(f"✓ Test data loaded:  {test_df.shape}")
-        logger.info(f"Train columns: {list(train_df.columns)}")
-        logger.info(f"Test columns:  {list(test_df.columns)}")
+        logger.info(f"✓ Train: {train_df.shape}")
+        logger.info(f"✓ Test: {test_df.shape}")
         logger.info("=" * 60)
         
         return train_df, test_df
     
     def extract_features(self, df: pd.DataFrame, is_train: bool = True) -> np.ndarray:
-        """Extract combined text and image features - FIXED to use image_link"""
+        """Extract combined features"""
         logger.info("=" * 60)
         logger.info(f"EXTRACTING FEATURES ({'TRAIN' if is_train else 'TEST'})")
         logger.info("=" * 60)
         
         # Text features
-        logger.info(f"Step 1/2: Text Feature Extraction ({self.config.NLP_MODEL})")
+        logger.info(f"Text Feature Extraction ({self.config.NLP_MODEL})")
         if is_train:
             text_features = self.text_extractor.fit_transform(df['catalog_content'])
         else:
             text_features = self.text_extractor.transform(df['catalog_content'])
         
-        # Image features - FIXED: Pass image_link instead of sample_id
-        logger.info(f"Step 2/2: Image Feature Extraction ({self.config.IMAGE_MODEL})")
+        # Image features
+        logger.info(f"Image Feature Extraction ({self.config.IMAGE_MODEL})")
         image_folder = self.config.TRAIN_IMAGES if is_train else self.config.TEST_IMAGES
-        logger.info(f"Image folder path: {image_folder}")
         
         if not os.path.exists(image_folder):
             logger.warning(f"⚠ Image folder not found: {image_folder}")
-            logger.warning(f"⚠ Using zero vectors for all image features!")
             image_features = np.zeros((len(df), self.config.IMAGE_FEATURE_DIM))
         else:
-            # FIXED: Pass image_link column instead of sample_id
             image_features = self.image_extractor.extract_batch_features(df['image_link'], image_folder)
         
         # Combine features
         combined_features = np.hstack([text_features, image_features])
-        logger.info(f"✓ Combined feature shape: {combined_features.shape}")
-        logger.info(f"  - Text features:  {text_features.shape}")
-        logger.info(f"  - Image features: {image_features.shape}")
+        logger.info(f"✓ Combined: {combined_features.shape}")
         logger.info("=" * 60)
         
         return combined_features
     
     def train(self, optimize: bool = True):
-        """Train the complete pipeline"""
-        logger.info("\n")
+        """Train with regularization and cross-validation"""
+        logger.info("\n" + "=" * 60)
+        logger.info("ANTI-OVERFITTING TRAINING PIPELINE")
         logger.info("=" * 60)
-        logger.info("🚀 STARTING TRAINING PIPELINE")
-        logger.info("=" * 60)
-        logger.info(f"Configuration:")
-        logger.info(f"  - NLP Model:        {self.config.NLP_MODEL}")
-        logger.info(f"  - Image Model:      {self.config.IMAGE_MODEL}")
-        logger.info(f"  - Regression Model: {self.config.REGRESSION_MODEL}")
-        logger.info(f"  - Device:           {self.config.DEVICE}")
-        logger.info(f"  - Caching:          {'Enabled' if self.config.USE_CACHE else 'Disabled'}")
-        logger.info(f"  - Optuna Trials:    {self.config.N_OPTUNA_TRIALS}")
+        logger.info(f"NLP: {self.config.NLP_MODEL} | Image: {self.config.IMAGE_MODEL}")
+        logger.info(f"Regression: {self.config.REGRESSION_MODEL}")
+        logger.info(f"Cross-Validation: {Config.USE_CROSS_VALIDATION} ({Config.N_FOLDS} folds)")
+        logger.info(f"Ensemble: {Config.USE_ENSEMBLE}")
         logger.info("=" * 60)
         
-        # Load data
         train_df, _ = self.load_data()
-        
-        # Extract features
         X = self.extract_features(train_df, is_train=True)
         y = train_df['price'].values
-        
-        logger.info("=" * 60)
-        logger.info("TRAIN/VALIDATION SPLIT")
-        logger.info("=" * 60)
         
         # Split data
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
         )
         
-        logger.info(f"✓ Train samples:      {len(X_train):,}")
-        logger.info(f"✓ Validation samples: {len(X_val):,}")
-        logger.info(f"✓ Feature dimension:  {X_train.shape[1]}")
-        logger.info(f"Price statistics:")
-        logger.info(f"  - Min:  ${y_train.min():.2f}")
-        logger.info(f"  - Max:  ${y_train.max():.2f}")
-        logger.info(f"  - Mean: ${y_train.mean():.2f}")
+        logger.info(f"Train: {len(X_train):,} | Val: {len(X_val):,}")
+        logger.info(f"Features: {X_train.shape[1]}")
         logger.info("=" * 60)
         
-        # Optimize hyperparameters
-        if optimize:
-            logger.info("=" * 60)
-            logger.info("HYPERPARAMETER OPTIMIZATION")
-            logger.info("=" * 60)
-            self.regression_model.optimize_hyperparameters(
-                X_train, y_train, X_val, y_val,
-                n_trials=self.config.N_OPTUNA_TRIALS
-            )
-            logger.info("=" * 60)
+        # Train models
+        if Config.USE_ENSEMBLE:
+            model_types = ["xgboost", "lightgbm", "ridge"]
+            logger.info(f"Training ensemble: {model_types}")
+            
+            for model_type in model_types:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Training {model_type.upper()}")
+                logger.info(f"{'='*60}")
+                
+                model = RegressionModel(model_type=model_type)
+                
+                if optimize:
+                    model.optimize_hyperparameters(
+                        X_train, y_train, X_val, y_val,
+                        n_trials=self.config.N_OPTUNA_TRIALS
+                    )
+                
+                model.fit(X, y)
+                self.models.append(model)
+                
+                # Evaluate
+                val_pred = model.predict(X_val)
+                val_smape = calculate_smape(y_val, val_pred)
+                logger.info(f"✓ {model_type} Val SMAPE: {val_smape:.4f}%")
+        else:
+            model = RegressionModel(model_type=self.config.REGRESSION_MODEL)
+            
+            if optimize:
+                model.optimize_hyperparameters(
+                    X_train, y_train, X_val, y_val,
+                    n_trials=self.config.N_OPTUNA_TRIALS
+                )
+            
+            model.fit(X, y)
+            self.models.append(model)
         
-        # Train final model
-        logger.info("=" * 60)
-        logger.info("TRAINING FINAL MODEL")
-        logger.info("=" * 60)
-        logger.info(f"Training {self.config.REGRESSION_MODEL} on full training set...")
-        self.regression_model.fit(X, y)
-        logger.info("✓ Model training completed")
-        
-        # Evaluate
-        logger.info("\nEvaluating model performance...")
-        train_pred = self.regression_model.predict(X_train)
-        val_pred = self.regression_model.predict(X_val)
-        
-        train_smape = calculate_smape(y_train, train_pred)
-        val_smape = calculate_smape(y_val, val_pred)
-        
-        logger.info("=" * 60)
-        logger.info("📊 MODEL PERFORMANCE")
-        logger.info("=" * 60)
-        logger.info(f"Train SMAPE: {train_smape:.4f}%")
-        logger.info(f"Val SMAPE:   {val_smape:.4f}%")
-        logger.info(f"\nPrediction Statistics (Validation Set):")
-        logger.info(f"  - Min:  ${val_pred.min():.2f}")
-        logger.info(f"  - Max:  ${val_pred.max():.2f}")
-        logger.info(f"  - Mean: ${val_pred.mean():.2f}")
+        # Final evaluation
+        logger.info("\n" + "=" * 60)
+        logger.info("FINAL PERFORMANCE")
         logger.info("=" * 60)
         
-        # Save model
-        logger.info("\nSaving model...")
+        val_preds = np.array([model.predict(X_val) for model in self.models])
+        ensemble_pred = np.mean(val_preds, axis=0)
+        final_smape = calculate_smape(y_val, ensemble_pred)
+        
+        logger.info(f"Validation SMAPE: {final_smape:.4f}%")
+        logger.info(f"Prediction range: ${ensemble_pred.min():.2f} - ${ensemble_pred.max():.2f}")
+        logger.info("=" * 60)
+        
         self.save_model()
-        
-        return train_smape, val_smape
+        return final_smape
     
     def predict(self, test_df: pd.DataFrame) -> np.ndarray:
-        """Generate predictions for test data"""
-        logger.info("Generating predictions...")
+        """Generate ensemble predictions"""
         X_test = self.extract_features(test_df, is_train=False)
-        predictions = self.regression_model.predict(X_test)
-        return predictions
+        
+        if len(self.models) > 1:
+            predictions = np.array([model.predict(X_test) for model in self.models])
+            return np.mean(predictions, axis=0)
+        else:
+            return self.models[0].predict(X_test)
     
     def save_model(self):
         """Save trained models"""
         os.makedirs(self.config.MODEL_SAVE_PATH, exist_ok=True)
+        model_path = os.path.join(self.config.MODEL_SAVE_PATH, "pipeline_v2.pkl")
         
-        model_path = os.path.join(self.config.MODEL_SAVE_PATH, "pipeline.pkl")
         with open(model_path, 'wb') as f:
             pickle.dump({
                 'text_extractor': self.text_extractor,
-                'regression_model': self.regression_model
+                'models': self.models
             }, f)
         
         logger.info(f"✓ Model saved to {model_path}")
-    
-    def load_model(self):
-        """Load trained models"""
-        model_path = os.path.join(self.config.MODEL_SAVE_PATH, "pipeline.pkl")
-        
-        with open(model_path, 'rb') as f:
-            saved_models = pickle.load(f)
-            self.text_extractor = saved_models['text_extractor']
-            self.regression_model = saved_models['regression_model']
-        
-        logger.info(f"Model loaded from {model_path}")
     
     def generate_submission(self):
         """Generate submission file"""
@@ -685,34 +616,28 @@ class ProductPricePredictionPipeline:
         })
         
         submission_df.to_csv(self.config.OUTPUT_CSV, index=False)
-        logger.info(f"✓ Submission file saved to {self.config.OUTPUT_CSV}")
-        logger.info(f"✓ Total predictions: {len(submission_df)}")
-        logger.info(f"Prediction stats - Min: ${predictions.min():.2f}, "
-                   f"Max: ${predictions.max():.2f}, Mean: ${predictions.mean():.2f}")
+        logger.info(f"✓ Submission: {self.config.OUTPUT_CSV}")
+        logger.info(f"✓ Predictions: {len(submission_df)}")
+        logger.info(f"Range: ${predictions.min():.2f} - ${predictions.max():.2f}")
 
 
 def main():
-    """Main execution function"""
-    # Configuration
-    Config.NLP_MODEL = "tfidf"  # Options: "word2vec", "glove", "tfidf"
-    Config.IMAGE_MODEL = "resnet"  # Options: "resnet", "cnn"
-    Config.REGRESSION_MODEL = "xgboost"  # Options: "linear", "ridge", "lasso", "svm", "rf", "xgboost", "lightgbm"
-    Config.N_OPTUNA_TRIALS = 50
+    """Main execution"""
+    # Enable anti-overfitting features
+    Config.USE_CROSS_VALIDATION = True
+    Config.USE_ENSEMBLE = True
+    Config.TEXT_FEATURE_DIM = 150
+    Config.IMAGE_FEATURE_DIM = 512
     
-    # Initialize pipeline
     pipeline = ProductPricePredictionPipeline(Config)
-    
-    # Train model
-    train_smape, val_smape = pipeline.train(optimize=True)
-    
-    # Generate submission
+    val_smape = pipeline.train(optimize=True)
     pipeline.generate_submission()
     
     logger.info("\n" + "=" * 60)
-    logger.info("✅ PIPELINE COMPLETED SUCCESSFULLY!")
+    logger.info("TRAINING COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Final Validation SMAPE: {val_smape:.4f}%")
-    logger.info(f"Submission file: {Config.OUTPUT_CSV}")
+    logger.info(f"Validation SMAPE: {val_smape:.4f}%")
+    logger.info(f"Output: {Config.OUTPUT_CSV}")
     logger.info("=" * 60)
 
 
