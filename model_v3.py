@@ -9,125 +9,6 @@ import logging
 from tqdm import tqdm
 import hashlib
 import json
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_percentage_error
-import xgboost as xgb
-import lightgbm as lgb
-from gensim.models import Word2Vec
-from sklearn.feature_extraction.text import TfidfVectorizer
-import re
-from PIL import Image
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-import optuna
-
-# Configure warnings and logging
-warnings.filterwarnings('ignore')
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-def train(self, optimize: bool = True):
-        """Train the complete pipeline"""
-        logger.info("\n")
-        logger.info("=" * 60)
-        logger.info("🚀 STARTING TRAINING PIPELINE")
-        logger.info("=" * 60)
-        logger.info(f"Configuration:")
-        logger.info(f"  - NLP Model:        {self.config.NLP_MODEL}")
-        logger.info(f"  - Image Model:      {self.config.IMAGE_MODEL}")
-        logger.info(f"  - Regression Model: {self.config.REGRESSION_MODEL}")
-        logger.info(f"  - Device:           {self.config.DEVICE}")
-        logger.info(f"  - Caching:          {'Enabled' if self.config.USE_CACHE else 'Disabled'}")
-        logger.info(f"  - Optuna Trials:    {self.config.N_OPTUNA_TRIALS}")
-        logger.info("=" * 60)
-        
-        # Load data
-        train_df, _ = self.load_data()
-        
-        # Extract features
-        X = self.extract_features(train_df, is_train=True)
-        y = train_df['price'].values
-        
-        logger.info("=" * 60)
-        logger.info("TRAIN/VALIDATION SPLIT")
-        logger.info("=" * 60)
-        
-        # Split data
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
-        )
-        
-        logger.info(f"✓ Train samples:      {len(X_train):,}")
-        logger.info(f"✓ Validation samples: {len(X_val):,}")
-        logger.info(f"✓ Feature dimension:  {X_train.shape[1]}")
-        logger.info(f"Price statistics:")
-        logger.info(f"  - Min:  ${y_train.min():.2f}")
-        logger.info(f"  - Max:  ${y_train.max():.2f}")
-        logger.info(f"  - Mean: ${y_train.mean():.2f}")
-        logger.info("=" * 60)
-        
-        # Optimize hyperparameters
-        if optimize:
-            logger.info("=" * 60)
-            logger.info("HYPERPARAMETER OPTIMIZATION")
-            logger.info("=" * 60)
-            self.regression_model.optimize_hyperparameters(
-                X_train, y_train, X_val, y_val,
-                n_trials=self.config.N_OPTUNA_TRIALS
-            )
-            logger.info("=" * 60)
-        
-        # Train final model
-        logger.info("=" * 60)
-        logger.info("TRAINING FINAL MODEL")
-        logger.info("=" * 60)
-        logger.info(f"Training {self.config.REGRESSION_MODEL} on full training set...")
-        self.regression_model.fit(X, y)
-        logger.info("✓ Model training completed")
-        
-        # Evaluate
-        logger.info("\nEvaluating model performance...")
-        train_pred = self.regression_model.predict(X_train)
-        val_pred = self.regression_model.predict(X_val)
-        
-        train_smape = calculate_smape(y_train, train_pred)
-        val_smape = calculate_smape(y_val, val_pred)
-        
-        logger.info("=" * 60)
-        logger.info("📊 MODEL PERFORMANCE")
-        logger.info("=" * 60)
-        logger.info(f"Train SMAPE: {train_smape:.4f}%")
-        logger.info(f"Val SMAPE:   {val_smape:.4f}%")
-        logger.info(f"\nPrediction Statistics (Validation Set):")
-        logger.info(f"  - Min:  ${val_pred.min():.2f}")
-        logger.info(f"  - Max:  ${val_pred.max():.2f}")
-        logger.info(f"  - Mean: ${val_pred.mean():.2f}")
-        logger.info("=" * 60)
-        
-        # Save model
-        logger.info("\nSaving model...")
-        self.save_model()
-        
-        return train_smape, val_smape  
-import numpy as np
-import os
-import pickle
-import warnings
-from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
-import logging
-from tqdm import tqdm
-import hashlib
-import json
 
 # ML Libraries
 from sklearn.model_selection import train_test_split
@@ -165,19 +46,17 @@ logger = logging.getLogger(__name__)
 class Config:
     """Configuration class for model parameters"""
     # ==================== DATASET PATHS ====================
-    # These are the paths to your CSV files
     TRAIN_CSV = "Data/student_resource/dataset/train.csv"
     TEST_CSV = "Data/student_resource/dataset/test.csv"
     
     # ==================== IMAGE PATHS ====================
-    # These are the folders where your downloaded images are stored
-    TRAIN_IMAGES = "image/train"  # Contains training images named as {sample_id}.jpg
-    TEST_IMAGES = "image/test"    # Contains test images named as {sample_id}.jpg
+    TRAIN_IMAGES = "image/train"
+    TEST_IMAGES = "image/test"
     
     # ==================== OUTPUT & CACHE PATHS ====================
     OUTPUT_CSV = "test_out.csv"
-    MODEL_SAVE_PATH = "models"        # Changed from "saved_models" to "models"
-    CACHE_PATH = "cache"              # For embedding and feature caching
+    MODEL_SAVE_PATH = "models"
+    CACHE_PATH = "cache"
     
     # Model Selection
     NLP_MODEL = "tfidf"  # Options: "word2vec", "glove", "tfidf"
@@ -194,7 +73,7 @@ class Config:
     IMAGE_FEATURE_DIM = 512
     
     # Caching Options
-    USE_CACHE = True  # Set to False to disable caching
+    USE_CACHE = True
     
     # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -264,7 +143,6 @@ class TextFeatureExtractor:
             )
         
         elif self.method == "glove":
-            # Using TfidfVectorizer as a baseline for GloVe simulation
             logger.info("Fitting GloVe-style vectorizer...")
             self.model = TfidfVectorizer(
                 max_features=self.feature_dim,
@@ -372,8 +250,8 @@ class ImageFeatureExtractor:
             logger.warning(f"Error processing image {image_path}: {e}")
             return np.zeros(self.feature_dim)
     
-    def extract_batch_features(self, sample_ids: pd.Series, image_folder: str) -> np.ndarray:
-        """Extract features from multiple images"""
+    def extract_batch_features(self, image_links: pd.Series, image_folder: str) -> np.ndarray:
+        """Extract features from multiple images - FIXED to use original filenames"""
         logger.info(f"Extracting image features from {image_folder}...")
         
         # Check cache
@@ -387,17 +265,29 @@ class ImageFeatureExtractor:
         features = []
         missing_count = 0
         
-        for sample_id in tqdm(sample_ids, desc="Processing images"):
-            image_path = os.path.join(image_folder, f"{sample_id}.jpg")
-            feature = self.extract_features(image_path)
-            if not os.path.exists(image_path):
+        # FIXED: Use image_link to get original filename
+        for image_link in tqdm(image_links, desc="Processing images"):
+            if isinstance(image_link, str):
+                # Get original filename from URL
+                image_filename = Path(image_link).name
+                image_path = os.path.join(image_folder, image_filename)
+            else:
+                image_path = None
+            
+            if image_path and os.path.exists(image_path):
+                feature = self.extract_features(image_path)
+            else:
+                feature = np.zeros(self.feature_dim)
                 missing_count += 1
+            
             features.append(feature)
         
         features = np.array(features)
         
         if missing_count > 0:
             logger.warning(f"⚠ {missing_count} images were missing (set to zero vectors)")
+        else:
+            logger.info(f"✓ All images found!")
         
         logger.info(f"✓ Image features extracted: {features.shape}")
         
@@ -592,7 +482,7 @@ class RegressionModel:
         """Predict using the regression model"""
         X_scaled = self.scaler.transform(X)
         predictions = self.model.predict(X_scaled)
-        return np.maximum(predictions, 0)  # Ensure positive prices
+        return np.maximum(predictions, 0)
 
 
 class ProductPricePredictionPipeline:
@@ -635,7 +525,7 @@ class ProductPricePredictionPipeline:
         return train_df, test_df
     
     def extract_features(self, df: pd.DataFrame, is_train: bool = True) -> np.ndarray:
-        """Extract combined text and image features"""
+        """Extract combined text and image features - FIXED to use image_link"""
         logger.info("=" * 60)
         logger.info(f"EXTRACTING FEATURES ({'TRAIN' if is_train else 'TEST'})")
         logger.info("=" * 60)
@@ -647,7 +537,7 @@ class ProductPricePredictionPipeline:
         else:
             text_features = self.text_extractor.transform(df['catalog_content'])
         
-        # Image features
+        # Image features - FIXED: Pass image_link instead of sample_id
         logger.info(f"Step 2/2: Image Feature Extraction ({self.config.IMAGE_MODEL})")
         image_folder = self.config.TRAIN_IMAGES if is_train else self.config.TEST_IMAGES
         logger.info(f"Image folder path: {image_folder}")
@@ -657,7 +547,8 @@ class ProductPricePredictionPipeline:
             logger.warning(f"⚠ Using zero vectors for all image features!")
             image_features = np.zeros((len(df), self.config.IMAGE_FEATURE_DIM))
         else:
-            image_features = self.image_extractor.extract_batch_features(df['sample_id'], image_folder)
+            # FIXED: Pass image_link column instead of sample_id
+            image_features = self.image_extractor.extract_batch_features(df['image_link'], image_folder)
         
         # Combine features
         combined_features = np.hstack([text_features, image_features])
@@ -670,12 +561,18 @@ class ProductPricePredictionPipeline:
     
     def train(self, optimize: bool = True):
         """Train the complete pipeline"""
-        logger.info("=" * 50)
-        logger.info("Starting Training Pipeline")
-        logger.info(f"NLP Model: {self.config.NLP_MODEL}")
-        logger.info(f"Image Model: {self.config.IMAGE_MODEL}")
-        logger.info(f"Regression Model: {self.config.REGRESSION_MODEL}")
-        logger.info("=" * 50)
+        logger.info("\n")
+        logger.info("=" * 60)
+        logger.info("🚀 STARTING TRAINING PIPELINE")
+        logger.info("=" * 60)
+        logger.info(f"Configuration:")
+        logger.info(f"  - NLP Model:        {self.config.NLP_MODEL}")
+        logger.info(f"  - Image Model:      {self.config.IMAGE_MODEL}")
+        logger.info(f"  - Regression Model: {self.config.REGRESSION_MODEL}")
+        logger.info(f"  - Device:           {self.config.DEVICE}")
+        logger.info(f"  - Caching:          {'Enabled' if self.config.USE_CACHE else 'Disabled'}")
+        logger.info(f"  - Optuna Trials:    {self.config.N_OPTUNA_TRIALS}")
+        logger.info("=" * 60)
         
         # Load data
         train_df, _ = self.load_data()
@@ -684,35 +581,64 @@ class ProductPricePredictionPipeline:
         X = self.extract_features(train_df, is_train=True)
         y = train_df['price'].values
         
+        logger.info("=" * 60)
+        logger.info("TRAIN/VALIDATION SPLIT")
+        logger.info("=" * 60)
+        
         # Split data
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
         )
         
-        logger.info(f"Train samples: {len(X_train)}, Validation samples: {len(X_val)}")
+        logger.info(f"✓ Train samples:      {len(X_train):,}")
+        logger.info(f"✓ Validation samples: {len(X_val):,}")
+        logger.info(f"✓ Feature dimension:  {X_train.shape[1]}")
+        logger.info(f"Price statistics:")
+        logger.info(f"  - Min:  ${y_train.min():.2f}")
+        logger.info(f"  - Max:  ${y_train.max():.2f}")
+        logger.info(f"  - Mean: ${y_train.mean():.2f}")
+        logger.info("=" * 60)
         
         # Optimize hyperparameters
         if optimize:
+            logger.info("=" * 60)
+            logger.info("HYPERPARAMETER OPTIMIZATION")
+            logger.info("=" * 60)
             self.regression_model.optimize_hyperparameters(
                 X_train, y_train, X_val, y_val,
                 n_trials=self.config.N_OPTUNA_TRIALS
             )
+            logger.info("=" * 60)
         
         # Train final model
-        logger.info("Training final model...")
+        logger.info("=" * 60)
+        logger.info("TRAINING FINAL MODEL")
+        logger.info("=" * 60)
+        logger.info(f"Training {self.config.REGRESSION_MODEL} on full training set...")
         self.regression_model.fit(X, y)
+        logger.info("✓ Model training completed")
         
         # Evaluate
+        logger.info("\nEvaluating model performance...")
         train_pred = self.regression_model.predict(X_train)
         val_pred = self.regression_model.predict(X_val)
         
         train_smape = calculate_smape(y_train, train_pred)
         val_smape = calculate_smape(y_val, val_pred)
         
+        logger.info("=" * 60)
+        logger.info("📊 MODEL PERFORMANCE")
+        logger.info("=" * 60)
         logger.info(f"Train SMAPE: {train_smape:.4f}%")
-        logger.info(f"Validation SMAPE: {val_smape:.4f}%")
+        logger.info(f"Val SMAPE:   {val_smape:.4f}%")
+        logger.info(f"\nPrediction Statistics (Validation Set):")
+        logger.info(f"  - Min:  ${val_pred.min():.2f}")
+        logger.info(f"  - Max:  ${val_pred.max():.2f}")
+        logger.info(f"  - Mean: ${val_pred.mean():.2f}")
+        logger.info("=" * 60)
         
         # Save model
+        logger.info("\nSaving model...")
         self.save_model()
         
         return train_smape, val_smape
@@ -735,7 +661,7 @@ class ProductPricePredictionPipeline:
                 'regression_model': self.regression_model
             }, f)
         
-        logger.info(f"Model saved to {model_path}")
+        logger.info(f"✓ Model saved to {model_path}")
     
     def load_model(self):
         """Load trained models"""
@@ -759,14 +685,15 @@ class ProductPricePredictionPipeline:
         })
         
         submission_df.to_csv(self.config.OUTPUT_CSV, index=False)
-        logger.info(f"Submission file saved to {self.config.OUTPUT_CSV}")
-        logger.info(f"Prediction stats - Min: {predictions.min():.2f}, "
-                   f"Max: {predictions.max():.2f}, Mean: {predictions.mean():.2f}")
+        logger.info(f"✓ Submission file saved to {self.config.OUTPUT_CSV}")
+        logger.info(f"✓ Total predictions: {len(submission_df)}")
+        logger.info(f"Prediction stats - Min: ${predictions.min():.2f}, "
+                   f"Max: ${predictions.max():.2f}, Mean: ${predictions.mean():.2f}")
 
 
 def main():
     """Main execution function"""
-    # You can modify these settings to switch between models
+    # Configuration
     Config.NLP_MODEL = "tfidf"  # Options: "word2vec", "glove", "tfidf"
     Config.IMAGE_MODEL = "resnet"  # Options: "resnet", "cnn"
     Config.REGRESSION_MODEL = "xgboost"  # Options: "linear", "ridge", "lasso", "svm", "rf", "xgboost", "lightgbm"
@@ -781,9 +708,12 @@ def main():
     # Generate submission
     pipeline.generate_submission()
     
-    logger.info("=" * 50)
-    logger.info("Pipeline completed successfully!")
-    logger.info("=" * 50)
+    logger.info("\n" + "=" * 60)
+    logger.info("✅ PIPELINE COMPLETED SUCCESSFULLY!")
+    logger.info("=" * 60)
+    logger.info(f"Final Validation SMAPE: {val_smape:.4f}%")
+    logger.info(f"Submission file: {Config.OUTPUT_CSV}")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
